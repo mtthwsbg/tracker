@@ -25,6 +25,10 @@ SAD_DELTA = 0.15        # sad score must beat your neutral baseline by this -> S
 SMOOTH_FRAMES = 5
 SIDEBAR_W = 280
 CALIB_FRAMES = 30
+PITCH_RANGE = 30.0      # degrees of up/down head tilt that reads as +/-100
+YAW_RANGE = 40.0        # degrees of left/right head turn that reads as +/-100
+TILT_SAD_COMP = 0.35    # how much looking up is discounted from the sad score (raise if looking up still reads Sad)
+PALM_MIN = 0.25         # how square-on the palm must face the camera before fingers are counted (0-1)
 
 WHITE = (255, 255, 255)
 RED = (0, 0, 255)
@@ -96,37 +100,77 @@ def classify_face(smile, sad, sad_base):
     return "Neutral"
 
 
-def draw_panel(h, fps, mood, smile, sad, sad_base, counts, calib):
-    """Right-hand sidebar (SIDEBAR_W px wide)."""
+def head_pose(lms, w, h):
+    """(pitch_up_deg, yaw_right_deg) from 3-D face landmarks. Mirrored feed: +yaw = toward the right of the screen."""
+    P = lambda i: (lms[i].x * w, lms[i].y * h, lms[i].z * w)
+    top, chin = P(10), P(152)
+    a, b = P(234), P(454)
+    lc, rc = (a, b) if a[0] <= b[0] else (b, a)          # left / right cheek in the image
+    pitch = np.degrees(np.arctan2(top[2] - chin[2], chin[1] - top[1]))   # chin nearer camera = looking up
+    yaw = np.degrees(np.arctan2(rc[2] - lc[2], rc[0] - lc[0]))           # right cheek farther = turned right
+    return float(pitch), float(yaw)
+
+
+def palm_facing(pts, label):
+    """True when the palm (not the back of the hand) faces the camera. Mirrored feed, labels already corrected."""
+    v1 = (pts[5][0] - pts[0][0], pts[5][1] - pts[0][1])
+    v2 = (pts[17][0] - pts[0][0], pts[17][1] - pts[0][1])
+    cross = v1[0] * v2[1] - v1[1] * v2[0]
+    sq = cross / max(np.hypot(*v1) * np.hypot(*v2), 1e-6)       # sine of the angle: ~0 when edge-on
+    return (sq if label == "Right" else -sq) > PALM_MIN
+
+
+def draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, calib):
+    """Right-hand sidebar (SIDEBAR_W px wide). tilt = (up/down, left/right) in -100..100 or None."""
     p = np.full((h, SIDEBAR_W, 3), (30, 30, 30), np.uint8)
     cv2.line(p, (0, 0), (0, h), (90, 90, 90), 2)
+    GREY, DIM = (190, 190, 190), (120, 120, 120)
 
     def header(s, y):
         text(p, s, (16, y), 0.6, (160, 160, 160), 1)
         cv2.line(p, (16, y + 8), (SIDEBAR_W - 16, y + 8), (70, 70, 70), 1)
 
-    text(p, f"{fps:.0f} FPS", (16, 38), 0.9, WHITE, 2)
+    def bar(v, y):      # centred -100..100 bar
+        x0, x1 = 16, SIDEBAR_W - 16
+        mid = (x0 + x1) // 2
+        cv2.rectangle(p, (x0, y), (x1, y + 6), (60, 60, 60), -1)
+        cv2.line(p, (mid, y - 2), (mid, y + 8), (150, 150, 150), 1)
+        if v is not None:
+            xe = mid + int(v / 100 * (x1 - mid))
+            cv2.rectangle(p, (min(mid, xe), y), (max(mid, xe), y + 6), (0, 200, 255), -1)
 
-    header("FACE", 80)
+    text(p, f"{fps:.0f} FPS", (16, 32), 0.8, WHITE, 2)
+
+    header("FACE", 66)
     colors = {"Happy": (0, 220, 0), "Sad": (255, 140, 40), "Neutral": WHITE}
-    text(p, mood if mood else "No face", (16, 125), 1.2, colors.get(mood, (120, 120, 120)), 2)
+    text(p, mood if mood else "No face", (16, 102), 1.1, colors.get(mood, DIM), 2)
     if mood:
-        text(p, f"smile {smile:.2f}", (16, 155), 0.5, (170, 170, 170), 1)
-        text(p, f"sad   {sad - sad_base:+.2f} (need {SAD_DELTA:.2f})", (16, 178), 0.5, (170, 170, 170), 1)
+        text(p, f"smile {smile:.2f}   sad {sad_rel:+.2f} / {SAD_DELTA:.2f}", (16, 124), 0.45, (170, 170, 170), 1)
 
-    header("HANDS", 225)
-    y = 270
+    header("TILT  (-100..100)", 156)
+    ud, lr = tilt if tilt else (None, None)
+    text(p, "Up / Down", (16, 190), 0.6, GREY, 1)
+    text(p, "--" if ud is None else f"{ud:+d}", (170, 190), 0.9, WHITE if tilt else DIM, 2)
+    bar(ud, 200)
+    text(p, "Left / Right", (16, 230), 0.6, GREY, 1)
+    text(p, "--" if lr is None else f"{lr:+d}", (170, 230), 0.9, WHITE if tilt else DIM, 2)
+    bar(lr, 240)
+
+    header("HANDS", 280)
+    y = 318
     for side in ("Left", "Right"):
         n = counts.get(side)
-        text(p, f"{side}:", (16, y), 0.8, (190, 190, 190), 1)
-        text(p, "--" if n is None else str(n), (150, y), 1.2, WHITE if n is not None else (120, 120, 120), 2)
-        y += 50
-    total = sum(counts.values()) if counts else None
-    text(p, "Total:", (16, y + 10), 0.8, (190, 190, 190), 1)
-    text(p, "--" if total is None else str(total), (150, y + 10), 1.2, WHITE if total is not None else (120, 120, 120), 2)
+        text(p, f"{side}:", (16, y), 0.8, GREY, 1)
+        text(p, "--" if n is None else str(n), (150, y), 1.2, WHITE if n is not None else DIM, 2)
+        if side in counts and n is None:
+            text(p, "no palm", (190, y), 0.45, DIM, 1)
+        y += 42
+    shown = [v for v in counts.values() if v is not None]
+    text(p, "Total:", (16, y + 4), 0.8, GREY, 1)
+    text(p, str(sum(shown)) if shown else "--", (150, y + 4), 1.2, WHITE if shown else DIM, 2)
 
-    text(p, "CALIBRATING..." if calib else "c = calibrate neutral", (16, h - 40), 0.5, (0, 200, 255) if calib else (140, 140, 140), 1)
-    text(p, "q / Esc = quit", (16, h - 16), 0.5, (140, 140, 140), 1)
+    text(p, "CALIBRATING - look straight" if calib else "c = calibrate (look straight)", (16, h - 34), 0.45, (0, 200, 255) if calib else (140, 140, 140), 1)
+    text(p, "q / Esc = quit", (16, h - 12), 0.45, (140, 140, 140), 1)
     return p
 
 
@@ -158,7 +202,10 @@ def main():
     count_hist = {}                     # handedness label -> deque of counts
     face_hist = deque(maxlen=SMOOTH_FRAMES)
     sad_base = 0.0
-    calib_buf = None                    # list while calibrating, else None
+    pitch0 = yaw0 = 0.0                 # 'looking straight' reference
+    calib_buf = []                      # list of (sad, pitch, yaw) while calibrating, else None; starts calibrating
+    tilt = None
+    sad_rel = 0.0
     mood = None
     smile = sad = 0.0
     t0 = time.time()
@@ -189,9 +236,12 @@ def main():
             pts = [(l.x * w, l.y * h) for l in lms]
             seen.add(label)
             hist = count_hist.setdefault(label, deque(maxlen=SMOOTH_FRAMES))
-            hist.append(count_fingers(pts))
-            n = majority(hist, 0)
-            counts[label] = n
+            if palm_facing(pts, label):
+                hist.append(count_fingers(pts))
+                counts[label] = majority(hist, 0)
+            else:
+                hist.clear()                    # palm hidden (fist/back of hand/head rest): don't count
+                counts[label] = None
 
             x1, y1, x2, y2 = bbox(pts, 20, w, h)                       # whole hand
             cv2.rectangle(frame, (x1, y1), (x2, y2), WHITE, 2)
@@ -212,23 +262,30 @@ def main():
             bs = {c.category_name: c.score for c in fres.face_blendshapes[0]}
             fpts = [(l.x * w, l.y * h) for l in fres.face_landmarks[0]]
             smile, sad = face_scores(bs, fpts)
+            pitch, yaw = head_pose(fres.face_landmarks[0], w, h)
             if calib_buf is not None:
-                calib_buf.append(sad)
+                calib_buf.append((sad, pitch, yaw))
                 if len(calib_buf) >= CALIB_FRAMES:
-                    sad_base = float(np.mean(calib_buf))
+                    sad_base, pitch0, yaw0 = (float(v) for v in np.mean(calib_buf, axis=0))
                     calib_buf = None
-            face_hist.append(classify_face(smile, sad, sad_base))
+            pn = float(np.clip((pitch - pitch0) / PITCH_RANGE, -1, 1))
+            yn = float(np.clip((yaw - yaw0) / YAW_RANGE, -1, 1))
+            tilt = (int(round(pn * 100)), int(round(yn * 100)))
+            sad_eff = sad - TILT_SAD_COMP * max(pn, 0)      # looking up bends the lips into a fake frown
+            sad_rel = sad_eff - sad_base
+            face_hist.append(classify_face(smile, sad_eff, sad_base))
             mood = majority(face_hist, "Neutral")
             fx1, fy1, fx2, fy2 = bbox(fpts, 10, w, h)
             cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), GREEN, 1)
         else:
             face_hist.clear()
             mood = None
+            tilt = None
 
         now = time.time()
         fps = 0.9 * fps + 0.1 / max(now - last, 1e-6)
         last = now
-        panel = draw_panel(h, fps, mood, smile, sad, sad_base, counts, calib_buf is not None)
+        panel = draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, calib_buf is not None)
         frame = np.hstack([frame, panel])
 
         if args.selftest:
