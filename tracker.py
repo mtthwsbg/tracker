@@ -21,8 +21,10 @@ FACE_MODEL = os.path.join(HERE, "models", "face_landmarker.task")
 
 # --- tuning knobs (adjust to your face) ---
 HAPPY_SMILE = 0.40      # avg mouthSmile blendshape above this -> Happy
-SAD_SCORE = 0.30        # frown + inner-brow + mouth-press score above this -> Sad
+SAD_DELTA = 0.15        # sad score must beat your neutral baseline by this -> Sad (lower = more sensitive)
 SMOOTH_FRAMES = 5
+SIDEBAR_W = 280
+CALIB_FRAMES = 30
 
 WHITE = (255, 255, 255)
 RED = (0, 0, 255)
@@ -69,16 +71,63 @@ def text(img, s, org, scale, color, thick=2):
     cv2.putText(img, s, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick, cv2.LINE_AA)
 
 
-def classify_face(bs):
-    smile = (bs.get("mouthSmileLeft", 0) + bs.get("mouthSmileRight", 0)) / 2
-    sad = (0.5 * (bs.get("mouthFrownLeft", 0) + bs.get("mouthFrownRight", 0)) / 2
-           + 0.3 * bs.get("browInnerUp", 0)
-           + 0.2 * (bs.get("mouthPressLeft", 0) + bs.get("mouthPressRight", 0)) / 2)
+def face_scores(bs, fpts):
+    """Returns (smile, sad) raw scores. Sad mixes blendshapes with mouth-corner droop."""
+    avg = lambda a, b: (bs.get(a, 0) + bs.get(b, 0)) / 2
+    smile = avg("mouthSmileLeft", "mouthSmileRight")
+    # mouth corners (61, 291) below the lip centre (13, 14) = frown; scaled by face height
+    face_h = max(fpts[152][1] - fpts[10][1], 1.0)
+    lip_mid = (fpts[13][1] + fpts[14][1]) / 2
+    droop = ((fpts[61][1] + fpts[291][1]) / 2 - lip_mid) / face_h
+    sad = (1.0 * avg("mouthFrownLeft", "mouthFrownRight")
+           + 0.5 * bs.get("browInnerUp", 0)
+           + 0.3 * avg("browDownLeft", "browDownRight")
+           + 0.5 * bs.get("mouthShrugLower", 0)
+           + 0.3 * avg("mouthPressLeft", "mouthPressRight")
+           + 8.0 * max(droop, 0))
+    return smile, sad
+
+
+def classify_face(smile, sad, sad_base):
     if smile > HAPPY_SMILE:
         return "Happy"
-    if sad > SAD_SCORE:
+    if sad - sad_base > SAD_DELTA:
         return "Sad"
     return "Neutral"
+
+
+def draw_panel(h, fps, mood, smile, sad, sad_base, counts, calib):
+    """Right-hand sidebar (SIDEBAR_W px wide)."""
+    p = np.full((h, SIDEBAR_W, 3), (30, 30, 30), np.uint8)
+    cv2.line(p, (0, 0), (0, h), (90, 90, 90), 2)
+
+    def header(s, y):
+        text(p, s, (16, y), 0.6, (160, 160, 160), 1)
+        cv2.line(p, (16, y + 8), (SIDEBAR_W - 16, y + 8), (70, 70, 70), 1)
+
+    text(p, f"{fps:.0f} FPS", (16, 38), 0.9, WHITE, 2)
+
+    header("FACE", 80)
+    colors = {"Happy": (0, 220, 0), "Sad": (255, 140, 40), "Neutral": WHITE}
+    text(p, mood if mood else "No face", (16, 125), 1.2, colors.get(mood, (120, 120, 120)), 2)
+    if mood:
+        text(p, f"smile {smile:.2f}", (16, 155), 0.5, (170, 170, 170), 1)
+        text(p, f"sad   {sad - sad_base:+.2f} (need {SAD_DELTA:.2f})", (16, 178), 0.5, (170, 170, 170), 1)
+
+    header("HANDS", 225)
+    y = 270
+    for side in ("Left", "Right"):
+        n = counts.get(side)
+        text(p, f"{side}:", (16, y), 0.8, (190, 190, 190), 1)
+        text(p, "--" if n is None else str(n), (150, y), 1.2, WHITE if n is not None else (120, 120, 120), 2)
+        y += 50
+    total = sum(counts.values()) if counts else None
+    text(p, "Total:", (16, y + 10), 0.8, (190, 190, 190), 1)
+    text(p, "--" if total is None else str(total), (150, y + 10), 1.2, WHITE if total is not None else (120, 120, 120), 2)
+
+    text(p, "CALIBRATING..." if calib else "c = calibrate neutral", (16, h - 40), 0.5, (0, 200, 255) if calib else (140, 140, 140), 1)
+    text(p, "q / Esc = quit", (16, h - 16), 0.5, (140, 140, 140), 1)
+    return p
 
 
 def majority(buf, default):
@@ -108,6 +157,10 @@ def main():
 
     count_hist = {}                     # handedness label -> deque of counts
     face_hist = deque(maxlen=SMOOTH_FRAMES)
+    sad_base = 0.0
+    calib_buf = None                    # list while calibrating, else None
+    mood = None
+    smile = sad = 0.0
     t0 = time.time()
     frames = hand_frames = face_frames = 0
     fps = 0.0
@@ -128,7 +181,7 @@ def main():
         frames += 1
 
         # ---- hands ----
-        total = 0
+        counts = {}
         seen = set()
         for i, lms in enumerate(hres.hand_landmarks):
             label = hres.handedness[i][0].category_name
@@ -137,7 +190,7 @@ def main():
             hist = count_hist.setdefault(label, deque(maxlen=SMOOTH_FRAMES))
             hist.append(count_fingers(pts))
             n = majority(hist, 0)
-            total += n
+            counts[label] = n
 
             x1, y1, x2, y2 = bbox(pts, 20, w, h)                       # whole hand
             cv2.rectangle(frame, (x1, y1), (x2, y2), WHITE, 2)
@@ -153,26 +206,31 @@ def main():
                 del count_hist[k]
         if hres.hand_landmarks:
             hand_frames += 1
-        if len(hres.hand_landmarks) == 2:
-            text(frame, f"Total: {total}", (10, 40), 1.0, WHITE)
-
         # ---- face ----
         if fres.face_landmarks:
             face_frames += 1
             bs = {c.category_name: c.score for c in fres.face_blendshapes[0]}
-            face_hist.append(classify_face(bs))
-            mood = majority(face_hist, "Neutral")
             fpts = [(l.x * w, l.y * h) for l in fres.face_landmarks[0]]
+            smile, sad = face_scores(bs, fpts)
+            if calib_buf is not None:
+                calib_buf.append(sad)
+                if len(calib_buf) >= CALIB_FRAMES:
+                    sad_base = float(np.mean(calib_buf))
+                    calib_buf = None
+            face_hist.append(classify_face(smile, sad, sad_base))
+            mood = majority(face_hist, "Neutral")
             fx1, fy1, fx2, fy2 = bbox(fpts, 10, w, h)
             cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), GREEN, 1)
             text(frame, mood, (fx1, min(fy2 + 35, h - 10)), 1.1, GREEN, 2)
         else:
             face_hist.clear()
+            mood = None
 
         now = time.time()
         fps = 0.9 * fps + 0.1 / max(now - last, 1e-6)
         last = now
-        text(frame, f"{fps:.0f} fps", (w - 110, 30), 0.7, WHITE, 2)
+        panel = draw_panel(h, fps, mood, smile, sad, sad_base, counts, calib_buf is not None)
+        frame = np.hstack([frame, panel])
 
         if args.selftest:
             if frames >= 60:
@@ -180,6 +238,8 @@ def main():
             continue
         cv2.imshow("Hand + Face Tracker (q to quit)", frame)
         key = cv2.waitKey(1) & 0xFF
+        if key == ord("c"):
+            calib_buf = []
         if key in (ord("q"), 27) or cv2.getWindowProperty("Hand + Face Tracker (q to quit)", cv2.WND_PROP_VISIBLE) < 1:
             break
 
