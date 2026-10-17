@@ -184,7 +184,8 @@ def main():
         counts = {}
         seen = set()
         for i, lms in enumerate(hres.hand_landmarks):
-            label = hres.handedness[i][0].category_name
+            # MediaPipe's label is swapped for this mirrored feed, so flip it
+            label = "Right" if hres.handedness[i][0].category_name == "Left" else "Left"
             pts = [(l.x * w, l.y * h) for l in lms]
             seen.add(label)
             hist = count_hist.setdefault(label, deque(maxlen=SMOOTH_FRAMES))
@@ -200,7 +201,6 @@ def main():
                 cv2.line(frame, tuple(map(int, pts[a])), tuple(map(int, pts[b])), RED, 2, cv2.LINE_AA)
             for p in pts:
                 cv2.circle(frame, (int(p[0]), int(p[1])), 4, RED, -1, cv2.LINE_AA)
-            text(frame, str(n), (x1, max(y1 - 10, 50)), 1.8, WHITE, 3)
         for k in list(count_hist):
             if k not in seen:
                 del count_hist[k]
@@ -221,7 +221,6 @@ def main():
             mood = majority(face_hist, "Neutral")
             fx1, fy1, fx2, fy2 = bbox(fpts, 10, w, h)
             cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), GREEN, 1)
-            text(frame, mood, (fx1, min(fy2 + 35, h - 10)), 1.1, GREEN, 2)
         else:
             face_hist.clear()
             mood = None
