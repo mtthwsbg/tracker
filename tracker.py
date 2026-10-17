@@ -6,7 +6,9 @@ Keys:  q or Esc quits.   Usage: tracker.py [--camera N] [--selftest]
 """
 import argparse
 import os
+import sys
 import time
+import urllib.request
 from collections import deque
 
 import cv2
@@ -18,6 +20,10 @@ from mediapipe.tasks.python import vision
 HERE = os.path.dirname(os.path.abspath(__file__))
 HAND_MODEL = os.path.join(HERE, "models", "hand_landmarker.task")
 FACE_MODEL = os.path.join(HERE, "models", "face_landmarker.task")
+MODEL_URLS = {
+    HAND_MODEL: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task",
+    FACE_MODEL: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task",
+}
 
 # --- tuning knobs (adjust to your face) ---
 HAPPY_SMILE = 0.40      # avg mouthSmile blendshape above this -> Happy
@@ -34,14 +40,6 @@ WHITE = (255, 255, 255)
 RED = (0, 0, 255)
 GREEN = (0, 220, 0)
 
-HAND_CONNECTIONS = [
-    (0, 1), (1, 2), (2, 3), (3, 4),
-    (0, 5), (5, 6), (6, 7), (7, 8),
-    (5, 9), (9, 10), (10, 11), (11, 12),
-    (9, 13), (13, 14), (14, 15), (15, 16),
-    (13, 17), (17, 18), (18, 19), (19, 20),
-    (0, 17),
-]
 PALM_POINTS = [0, 1, 5, 9, 13, 17]
 
 
@@ -80,7 +78,6 @@ def bbox(pts, pad, w, h):
 
 
 def text(img, s, org, scale, color, thick=2):
-    cv2.putText(img, s, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thick + 3, cv2.LINE_AA)
     cv2.putText(img, s, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick, cv2.LINE_AA)
 
 
@@ -192,15 +189,27 @@ def majority(buf, default):
     return max(set(buf), key=list(buf).count) if buf else default
 
 
+def ensure_models():
+    """Download the two MediaPipe model files on first run."""
+    for path, url in MODEL_URLS.items():
+        if os.path.exists(path):
+            continue
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        print(f"Downloading {os.path.basename(path)} (one-time)...")
+        try:
+            urllib.request.urlretrieve(url, path + ".part")
+            os.replace(path + ".part", path)
+        except Exception as e:
+            raise SystemExit(f"Could not download {url} ({e}). Download it manually into the models/ folder.")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--camera", type=int, default=0)
     ap.add_argument("--selftest", action="store_true", help="grab ~60 frames, print stats, exit")
     args = ap.parse_args()
 
-    for m in (HAND_MODEL, FACE_MODEL):
-        if not os.path.exists(m):
-            raise SystemExit(f"Missing model: {m}")
+    ensure_models()
 
     hands = vision.HandLandmarker.create_from_options(vision.HandLandmarkerOptions(
         base_options=mp_py.BaseOptions(model_asset_path=HAND_MODEL),
@@ -209,7 +218,7 @@ def main():
         base_options=mp_py.BaseOptions(model_asset_path=FACE_MODEL),
         running_mode=vision.RunningMode.VIDEO, num_faces=1, output_face_blendshapes=True))
 
-    cap = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW)
+    cap = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY)
     if not cap.isOpened():
         raise SystemExit(f"Could not open camera {args.camera}. Try --camera 1.")
 

@@ -1,6 +1,38 @@
-﻿# Hand + Face Tracker
-Live webcam tracker (Python + MediaPipe). Hands: white boxes (hand + palm), red skeleton, finger count (fist = 0). Face: Happy / Neutral / Sad.
+# Hand + Face Tracker
 
-Run: double-click `run.cmd` (q or Esc quits; `--camera 1` picks another camera; `--selftest` checks camera + models).
-Setup: venv at %LOCALAPPDATA%\vision-tracker-venv with `pip install -r requirements.txt`; download `hand_landmarker.task` and `face_landmarker.task` from storage.googleapis.com/mediapipe-models into `models/`.
-Tuning: HAPPY_SMILE and SAD_SCORE at the top of tracker.py.
+Live webcam tracker in Python (MediaPipe + OpenCV). Runs offline on a normal laptop CPU.
+
+- **Hands** (up to 2): white box around the hand and the palm, red skeleton on the raised fingers, live finger count (fist = 0).
+  Hidden or curled fingers are not drawn or counted. Counting pauses when the hand is edge-on or resting on your face.
+- **Face:** Happy / Neutral / Sad, with the sad score corrected for head tilt (looking up no longer fakes a frown).
+- **Head tilt:** Up/Down and Left/Right gauges from -100 to 100 (0 = looking straight; view is mirrored like a selfie).
+- A sidebar on the right shows everything: FPS, expression, tilt, left/right/total finger counts.
+
+## Run it
+
+Needs Python 3.9+ and a webcam. The two model files (about 11 MB) download automatically on first run.
+
+**Windows:** double-click `setup.cmd` once, then `run.cmd`.
+
+**Mac / Linux:**
+```
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python tracker.py
+```
+
+Options: `--camera 1` (pick another camera), `--selftest` (grab 60 frames headless and print stats).
+
+## Keys
+- `c` - calibrate: look straight with a relaxed face (also happens automatically at start)
+- `q` or `Esc` - quit
+
+## Tuning (top of `tracker.py`)
+| Constant | Effect |
+|---|---|
+| `HAPPY_SMILE` | smile score needed for Happy (lower = easier) |
+| `SAD_DELTA` | how far above your neutral the sad score must go (lower = more sensitive) |
+| `TILT_SAD_COMP` | how much looking up is discounted from "sad" |
+| `PITCH_RANGE`, `YAW_RANGE` | degrees of head tilt that read as +/-100 |
+| `UP_ON`, `UP_OFF` | finger straightness to switch on / off (lower = counts more easily) |
+| `PALM_MIN` | how square-on the hand must face the camera to be counted |
