@@ -28,7 +28,7 @@ CALIB_FRAMES = 30
 PITCH_RANGE = 30.0      # degrees of up/down head tilt that reads as +/-100
 YAW_RANGE = 40.0        # degrees of left/right head turn that reads as +/-100
 TILT_SAD_COMP = 0.35    # how much looking up is discounted from the sad score (raise if looking up still reads Sad)
-PALM_MIN = 0.25         # how square-on the palm must face the camera before fingers are counted (0-1)
+PALM_MIN = 0.25         # how square-on (palm or back) the hand must face the camera to be counted (0-1)
 
 WHITE = (255, 255, 255)
 RED = (0, 0, 255)
@@ -111,13 +111,18 @@ def head_pose(lms, w, h):
     return float(pitch), float(yaw)
 
 
-def palm_facing(pts, label):
-    """True when the palm (not the back of the hand) faces the camera. Mirrored feed, labels already corrected."""
+def hand_countable(pts, face_box):
+    """Palm OR back of the hand toward the camera counts; edge-on hands and hands resting on the face don't."""
     v1 = (pts[5][0] - pts[0][0], pts[5][1] - pts[0][1])
     v2 = (pts[17][0] - pts[0][0], pts[17][1] - pts[0][1])
     cross = v1[0] * v2[1] - v1[1] * v2[0]
-    sq = cross / max(np.hypot(*v1) * np.hypot(*v2), 1e-6)       # sine of the angle: ~0 when edge-on
-    return (sq if label == "Right" else -sq) > PALM_MIN
+    flat = abs(cross) / max(np.hypot(*v1) * np.hypot(*v2), 1e-6) > PALM_MIN   # ~0 when edge-on
+    if face_box is not None:                       # hand's centre inside the face box = resting on the face
+        cx = sum(q[0] for q in pts) / len(pts)
+        cy = sum(q[1] for q in pts) / len(pts)
+        if face_box[0] < cx < face_box[2] and face_box[1] < cy < face_box[3]:
+            return False
+    return flat
 
 
 def draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, calib):
@@ -163,7 +168,7 @@ def draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, calib):
         text(p, f"{side}:", (16, y), 0.8, GREY, 1)
         text(p, "--" if n is None else str(n), (150, y), 1.2, WHITE if n is not None else DIM, 2)
         if side in counts and n is None:
-            text(p, "no palm", (190, y), 0.45, DIM, 1)
+            text(p, "paused", (190, y), 0.45, DIM, 1)
         y += 42
     shown = [v for v in counts.values() if v is not None]
     text(p, "Total:", (16, y + 4), 0.8, GREY, 1)
@@ -206,6 +211,7 @@ def main():
     calib_buf = []                      # list of (sad, pitch, yaw) while calibrating, else None; starts calibrating
     tilt = None
     sad_rel = 0.0
+    face_box = None                     # last seen face box, used to ignore a hand resting on the face
     mood = None
     smile = sad = 0.0
     t0 = time.time()
@@ -236,11 +242,11 @@ def main():
             pts = [(l.x * w, l.y * h) for l in lms]
             seen.add(label)
             hist = count_hist.setdefault(label, deque(maxlen=SMOOTH_FRAMES))
-            if palm_facing(pts, label):
+            if hand_countable(pts, face_box):
                 hist.append(count_fingers(pts))
                 counts[label] = majority(hist, 0)
             else:
-                hist.clear()                    # palm hidden (fist/back of hand/head rest): don't count
+                hist.clear()                    # edge-on or resting on the face: don't count
                 counts[label] = None
 
             x1, y1, x2, y2 = bbox(pts, 20, w, h)                       # whole hand
@@ -277,10 +283,12 @@ def main():
             mood = majority(face_hist, "Neutral")
             fx1, fy1, fx2, fy2 = bbox(fpts, 10, w, h)
             cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), GREEN, 1)
+            face_box = (fx1, fy1, fx2, fy2)
         else:
             face_hist.clear()
             mood = None
             tilt = None
+            face_box = None
 
         now = time.time()
         fps = 0.9 * fps + 0.1 / max(now - last, 1e-6)
