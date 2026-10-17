@@ -112,7 +112,7 @@ def head_pose(lms, w, h):
     top, chin = P(10), P(152)
     a, b = P(234), P(454)
     lc, rc = (a, b) if a[0] <= b[0] else (b, a)          # left / right cheek in the image
-    pitch = np.degrees(np.arctan2(top[2] - chin[2], chin[1] - top[1]))   # chin nearer camera = looking up
+    pitch = np.degrees(np.arctan2(chin[2] - top[2], chin[1] - top[1]))   # chin farther from camera = looking up
     yaw = np.degrees(np.arctan2(rc[2] - lc[2], rc[0] - lc[0]))           # right cheek farther = turned right
     return float(pitch), float(yaw)
 
