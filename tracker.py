@@ -22,7 +22,7 @@ FACE_MODEL = os.path.join(HERE, "models", "face_landmarker.task")
 # --- tuning knobs (adjust to your face) ---
 HAPPY_SMILE = 0.40      # avg mouthSmile blendshape above this -> Happy
 SAD_DELTA = 0.15        # sad score must beat your neutral baseline by this -> Sad (lower = more sensitive)
-SMOOTH_FRAMES = 5
+SMOOTH_FRAMES = 7
 SIDEBAR_W = 280
 CALIB_FRAMES = 30
 PITCH_RANGE = 30.0      # degrees of up/down head tilt that reads as +/-100
@@ -49,18 +49,27 @@ def dist(a, b):
     return float(np.hypot(a[0] - b[0], a[1] - b[1]))
 
 
-def count_fingers(pts):
-    """pts: list of 21 (x, y) pixel points. Orientation-independent."""
-    wrist = pts[0]
-    n = 0
-    # index, middle, ring, pinky: tip farther from wrist than the PIP joint
-    for tip, pip in ((8, 6), (12, 10), (16, 14), (20, 18)):
-        if dist(pts[tip], wrist) > dist(pts[pip], wrist) * 1.05:
-            n += 1
-    # thumb: tip farther from pinky knuckle than the thumb IP joint
-    if dist(pts[4], pts[17]) > dist(pts[3], pts[17]) * 1.05:
-        n += 1
-    return n
+FINGERS = ((1, 2, 3, 4), (5, 6, 7, 8), (9, 10, 11, 12), (13, 14, 15, 16), (17, 18, 19, 20))  # thumb..pinky joints
+PALM_LINES = [(0, 1), (0, 5), (5, 9), (9, 13), (13, 17), (0, 17)]
+UP_ON, UP_OFF = 0.80, 0.65     # finger straightness needed to switch on / to drop off (hysteresis stops flicker)
+
+
+def d3(a, b):
+    return float(np.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2))
+
+
+def finger_states(p3, prev):
+    """p3: 21 (x, y, z) points. A finger is 'up' when its joints form a straight chain (tip-to-base / chain length).
+    Straightness is 3-D, so tilting the hand doesn't fake a curl; curled fingers score low."""
+    out = []
+    for k, (m, a, b, t) in enumerate(FINGERS):
+        chain = d3(p3[m], p3[a]) + d3(p3[a], p3[b]) + d3(p3[b], p3[t])
+        r = d3(p3[m], p3[t]) / max(chain, 1e-6)
+        up = r > (UP_OFF if prev[k] else UP_ON)
+        if k == 0:      # thumb must also point away from the palm
+            up = up and d3(p3[4], p3[17]) > d3(p3[3], p3[17]) * 1.05
+        out.append(bool(up))
+    return out
 
 
 def bbox(pts, pad, w, h):
@@ -205,6 +214,7 @@ def main():
         raise SystemExit(f"Could not open camera {args.camera}. Try --camera 1.")
 
     count_hist = {}                     # handedness label -> deque of counts
+    finger_state = {}                   # handedness label -> [thumb..pinky] up/down, for hysteresis
     face_hist = deque(maxlen=SMOOTH_FRAMES)
     sad_base = 0.0
     pitch0 = yaw0 = 0.0                 # 'looking straight' reference
@@ -240,26 +250,38 @@ def main():
             # MediaPipe's label is swapped for this mirrored feed, so flip it
             label = "Right" if hres.handedness[i][0].category_name == "Left" else "Left"
             pts = [(l.x * w, l.y * h) for l in lms]
+            p3 = [(l.x * w, l.y * h, l.z * w) for l in lms]
             seen.add(label)
             hist = count_hist.setdefault(label, deque(maxlen=SMOOTH_FRAMES))
+            prev = finger_state.setdefault(label, [False] * 5)
+            states = finger_states(p3, prev)
+            finger_state[label] = states
             if hand_countable(pts, face_box):
-                hist.append(count_fingers(pts))
+                hist.append(sum(states))
                 counts[label] = majority(hist, 0)
             else:
                 hist.clear()                    # edge-on or resting on the face: don't count
                 counts[label] = None
 
-            x1, y1, x2, y2 = bbox(pts, 20, w, h)                       # whole hand
+            # draw only what is really visible: palm + straight (raised) fingers
+            shown = set(PALM_POINTS)
+            lines = list(PALM_LINES)
+            for up, (m, a, b, t) in zip(states, FINGERS):
+                if up:
+                    shown.update((m, a, b, t))
+                    lines += [(m, a), (a, b), (b, t)]
+            x1, y1, x2, y2 = bbox([pts[j] for j in shown], 20, w, h)    # whole hand (visible parts)
             cv2.rectangle(frame, (x1, y1), (x2, y2), WHITE, 2)
             px1, py1, px2, py2 = bbox([pts[j] for j in PALM_POINTS], 6, w, h)  # palm
             cv2.rectangle(frame, (px1, py1), (px2, py2), WHITE, 2)
-            for a, b in HAND_CONNECTIONS:
+            for a, b in lines:
                 cv2.line(frame, tuple(map(int, pts[a])), tuple(map(int, pts[b])), RED, 2, cv2.LINE_AA)
-            for p in pts:
-                cv2.circle(frame, (int(p[0]), int(p[1])), 4, RED, -1, cv2.LINE_AA)
+            for j in shown:
+                cv2.circle(frame, (int(pts[j][0]), int(pts[j][1])), 4, RED, -1, cv2.LINE_AA)
         for k in list(count_hist):
             if k not in seen:
                 del count_hist[k]
+                finger_state.pop(k, None)
         if hres.hand_landmarks:
             hand_frames += 1
         # ---- face ----
