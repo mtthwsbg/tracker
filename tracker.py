@@ -315,14 +315,15 @@ def main():
                 if up:
                     shown.update((m, a, b, t))
                     lines += [(m, a), (a, b), (b, t)]
-            x1, y1, x2, y2 = bbox([pts[j] for j in shown], 20, w, h)                    # hand box
-            cv2.rectangle(frame, (x1, y1), (x2, y2), WHITE, 2)
-            px1, py1, px2, py2 = bbox([pts[j] for j in PALM_POINTS], 6, w, h)           # palm box
-            cv2.rectangle(frame, (px1, py1), (px2, py2), WHITE, 2)
-            for a, b in lines:
-                cv2.line(frame, tuple(map(int, pts[a])), tuple(map(int, pts[b])), RED, 2, cv2.LINE_AA)
-            for j in shown:
-                cv2.circle(frame, (int(pts[j][0]), int(pts[j][1])), 4, RED, -1, cv2.LINE_AA)
+            if ui["tab"] == 1:                                              # hand overlay only on the hands tab
+                x1, y1, x2, y2 = bbox([pts[j] for j in shown], 20, w, h)                    # hand box
+                cv2.rectangle(frame, (x1, y1), (x2, y2), WHITE, 2)
+                px1, py1, px2, py2 = bbox([pts[j] for j in PALM_POINTS], 6, w, h)           # palm box
+                cv2.rectangle(frame, (px1, py1), (px2, py2), WHITE, 2)
+                for a, b in lines:
+                    cv2.line(frame, tuple(map(int, pts[a])), tuple(map(int, pts[b])), RED, 2, cv2.LINE_AA)
+                for j in shown:
+                    cv2.circle(frame, (int(pts[j][0]), int(pts[j][1])), 4, RED, -1, cv2.LINE_AA)
         for k in list(count_hist):                                          # drop hands that left the frame
             if k not in seen:
                 del count_hist[k]
@@ -350,7 +351,8 @@ def main():
             face_hist.append(classify_face(smile, sad_eff, sad_base))
             mood = majority(face_hist, "Neutral")
             fx1, fy1, fx2, fy2 = bbox(fpts, 10, w, h)
-            cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), GREEN, 1)
+            if ui["tab"] == 0:                                              # face box only on the face tab
+                cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), GREEN, 1)
             face_box = (fx1, fy1, fx2, fy2)
         else:
             face_hist.clear()
