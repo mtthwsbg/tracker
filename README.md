@@ -27,6 +27,8 @@ Options: `--camera 1` (pick another camera), `--selftest` (grab 60 frames headle
 - `c` - calibrate: look straight with a relaxed face (also happens automatically at start)
 - `q` or `Esc` - quit
 - `Tab`, `1`, `2`, or click a tab - switch between FACE and HANDS
+- `t` - track index fingertip (trail + coordinates), HANDS tab
+- `o` - track an object: drag a box around it on the video, HANDS tab
 
 ## Tuning (top of `tracker.py`)
 | Constant | Effect |
