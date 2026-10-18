@@ -127,23 +127,35 @@ def hand_countable(pts, face_box):
     return flat
 
 
-def draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, fstates, calib, tab):
-    p = np.full((h, SIDEBAR_W, 3), (30, 30, 30), np.uint8)
-    cv2.line(p, (0, 0), (0, h), (90, 90, 90), 2)
+def draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, fstates, calib, tab, k=1.0):
+    # everything is drawn at the final pixel size (k = display scale), so text stays sharp when the window is resized
+    p = np.full((int(h*k), int(SIDEBAR_W*k), 3), (30, 30, 30), np.uint8)
+    P = lambda pt: (int(round(pt[0]*k)), int(round(pt[1]*k)))
+    T = lambda v: max(1, int(round(v*k)))
+
+    def text(img, s, org, scale, color, thick=2):
+        cv2.putText(img, s, P(org), cv2.FONT_HERSHEY_SIMPLEX, scale*k, color, T(thick), cv2.LINE_AA)
+
+    class V:
+        line = staticmethod(lambda img, a, b, c, t=1, lt=cv2.LINE_8: cv2.line(img, P(a), P(b), c, T(t), cv2.LINE_AA))
+        rectangle = staticmethod(lambda img, a, b, c, t=1: cv2.rectangle(img, P(a), P(b), c, -1 if t < 0 else T(t)))
+        circle = staticmethod(lambda img, c, r, col, t=1, lt=cv2.LINE_8: cv2.circle(img, P(c), T(r), col, -1 if t < 0 else T(t), cv2.LINE_AA))
+
+    V.line(p, (0, 0), (0, h), (90, 90, 90), 2)
     GREY, DIM = (190, 190, 190), (120, 120, 120)
 
     def header(s, y):
         text(p, s, (16, y), 0.6, (160, 160, 160), 1)
-        cv2.line(p, (16, y + 8), (SIDEBAR_W - 16, y + 8), (70, 70, 70), 1)
+        V.line(p, (16, y + 8), (SIDEBAR_W - 16, y + 8), (70, 70, 70), 1)
 
     def bar(v, y):                                                          # centered bar, -100 to 100
         x0, x1 = 16, SIDEBAR_W - 16
         mid = (x0 + x1)//2
-        cv2.rectangle(p, (x0, y), (x1, y + 6), (60, 60, 60), -1)
-        cv2.line(p, (mid, y - 2), (mid, y + 8), (150, 150, 150), 1)
+        V.rectangle(p, (x0, y), (x1, y + 6), (60, 60, 60), -1)
+        V.line(p, (mid, y - 2), (mid, y + 8), (150, 150, 150), 1)
         if v is not None:
             xe = mid + int(v/100*(x1 - mid))
-            cv2.rectangle(p, (min(mid, xe), y), (max(mid, xe), y + 6), (0, 200, 255), -1)
+            V.rectangle(p, (min(mid, xe), y), (max(mid, xe), y + 6), (0, 200, 255), -1)
 
     text(p, f"{fps:.0f} FPS", (16, 32), 0.8, WHITE, 2)
 
@@ -151,10 +163,10 @@ def draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, fstates, calib, tab):
     for i, name in enumerate(TABS):
         x0, x1 = TAB_X[i]
         on = i == tab
-        cv2.rectangle(p, (x0, TAB_Y0), (x1, TAB_Y1), (70, 70, 70) if on else (45, 45, 45), -1)
+        V.rectangle(p, (x0, TAB_Y0), (x1, TAB_Y1), (70, 70, 70) if on else (45, 45, 45), -1)
         text(p, name, (x0 + 14, TAB_Y1 - 10), 0.6, WHITE if on else DIM, 1)
         if on:
-            cv2.line(p, (x0, TAB_Y1), (x1, TAB_Y1), (0, 200, 255), 2)
+            V.line(p, (x0, TAB_Y1), (x1, TAB_Y1), (0, 200, 255), 2)
 
     if tab == 0:
         # mood
@@ -197,7 +209,7 @@ def draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, fstates, calib, tab):
             for i, nm in enumerate(("T", "I", "M", "R", "P")):
                 cx = 60 + i*42
                 up = bool(sts[i]) if sts else False
-                cv2.circle(p, (cx, y - 6), 11, GREEN if up else (60, 60, 60), -1 if up else 2, cv2.LINE_AA)
+                V.circle(p, (cx, y - 6), 11, GREEN if up else (60, 60, 60), -1 if up else 2, cv2.LINE_AA)
                 text(p, nm, (cx - 5, y + 28), 0.4, DIM, 1)
             y += 58
 
@@ -246,12 +258,13 @@ def main():
         raise SystemExit(f"Could not open camera {args.camera}. Try --camera 1.")
 
     # window: resizable, tabs switch on click (mouse coords arrive in image pixels)
-    ui = {"tab": 0, "w": 0}
+    ui = {"tab": 0, "w": 0, "k": 1.0}
     def on_mouse(ev, x, y, flags, _):
-        if ev != cv2.EVENT_LBUTTONDOWN or not TAB_Y0 <= y <= TAB_Y1:
+        k = ui["k"]
+        if ev != cv2.EVENT_LBUTTONDOWN or not TAB_Y0*k <= y <= TAB_Y1*k:
             return
         for i, (x0, x1) in enumerate(TAB_X):
-            if ui["w"] + x0 <= x <= ui["w"] + x1:
+            if ui["w"] + x0*k <= x <= ui["w"] + x1*k:
                 ui["tab"] = i
     if not args.selftest:
         cv2.namedWindow(WIN, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
@@ -364,8 +377,17 @@ def main():
         now = time.time()
         fps = 0.9*fps + 0.1/max(now - last, 1e-6)                           # smoothed fps
         last = now
-        panel = draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, finger_state, calib_buf is not None, ui["tab"])
-        ui["w"] = w
+        # fit to the window: scale the video, then draw the sidebar at that size
+        try:
+            _, _, rw, rh = cv2.getWindowImageRect(WIN)
+        except cv2.error:
+            rw = rh = 0
+        k = min(rw/(w + SIDEBAR_W), rh/h) if rw > 0 and rh > 0 else 1.0
+        k = max(k, 0.5)
+        if abs(k - 1) > 0.01:
+            frame = cv2.resize(frame, (int(w*k), int(h*k)), interpolation=cv2.INTER_AREA if k < 1 else cv2.INTER_CUBIC)
+        panel = draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, finger_state, calib_buf is not None, ui["tab"], k)
+        ui["w"], ui["k"] = frame.shape[1], k
         frame = np.hstack([frame, panel])
 
         if args.selftest:
