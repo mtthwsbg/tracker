@@ -6,7 +6,7 @@ Live webcam tracker in Python (MediaPipe + OpenCV). Runs offline on a normal lap
   Hidden or curled fingers are not drawn or counted. Counting pauses when the hand is edge-on or resting on your face.
 - **Face:** Happy / Neutral / Sad, with the sad score corrected for head tilt (looking up no longer fakes a frown).
 - **Head tilt:** Up/Down and Left/Right gauges from -100 to 100 (0 = looking straight; view is mirrored like a selfie).
-- A sidebar on the right shows everything: FPS, expression, tilt, left/right/total finger counts.
+- A sidebar on the right with two tabs. FACE: expression and tilt. HANDS: left/right/total finger counts and each finger up or down. The window is resizable.
 
 ## Run it
 
@@ -26,6 +26,7 @@ Options: `--camera 1` (pick another camera), `--selftest` (grab 60 frames headle
 ## Keys
 - `c` - calibrate: look straight with a relaxed face (also happens automatically at start)
 - `q` or `Esc` - quit
+- `Tab`, `1`, `2`, or click a tab - switch between FACE and HANDS
 
 ## Tuning (top of `tracker.py`)
 | Constant | Effect |
