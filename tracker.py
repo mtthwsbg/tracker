@@ -357,6 +357,11 @@ def hand_countable(pts, face_box):
     return flat
 
 
+def clock(sec):
+    sec = int(sec)
+    return f"{sec//3600}:{sec//60%60:02d}:{sec%60:02d}" if sec >= 3600 else f"{sec//60:02d}:{sec%60:02d}"
+
+
 def draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, fstates, calib, tab, k=1.0, info=None):
     info = info or {}
     # everything is drawn at the final pixel size (k = display scale), so text stays sharp when the window is resized
@@ -389,6 +394,7 @@ def draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, fstates, calib, tab, 
             V.rectangle(p, (min(mid, xe), y), (max(mid, xe), y + 6), (0, 200, 255), -1)
 
     text(p, f"{fps:.0f} FPS", (16, 32), 0.8, WHITE, 2)
+    text(p, f"running {clock(info.get('elapsed', 0))}", (150, 30), 0.55, (170, 170, 170), 1)
 
     # tabs
     for i, name in enumerate(TABS):
@@ -428,7 +434,10 @@ def draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, fstates, calib, tab, 
         else:
             big = f"{1/br:.1f} s"                                           # seconds per blink
         text(p, big, (16, 368), 0.9, WHITE if br is not None else DIM, 2)
-        text(p, "" if br is None else f"per blink   total {info.get('blink_total', 0)}", (150, 368), 0.45, (170, 170, 170), 1)
+        if br is not None:
+            bw = cv2.getTextSize(big, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)[0][0]      # put "per blink" right after the seconds
+            text(p, "per blink", (16 + bw + 8, 368), 0.55, GREY, 1)
+        text(p, f"{info.get('blink_total', 0)} blinks in {clock(info.get('elapsed', 0))}", (16, 394), 0.5, (170, 170, 170), 1)
     else:
         # finger count
         header("FINGERS UP", 108)
@@ -761,7 +770,7 @@ def main():
         while blink_times and now - blink_times[0] > BLINK_WINDOW:
             blink_times.popleft()
         span = min(BLINK_WINDOW, now - t0)
-        info = {"ang": ang_rel, "sur": sur_rel, "track": ui["track"], "tips": tips, "blink_total": blink_total,
+        info = {"elapsed": now - t0, "ang": ang_rel, "sur": sur_rel, "track": ui["track"], "tips": tips, "blink_total": blink_total,
                 "pinch": "pinching" if any(pinching.get(sd) for sd in counts) else None,
                 "auto": None if not ui["auto"] else (auto_hit[1] if auto_hit else "searching"),
                 "obj": None if ui["obj"] is None else ("drag a box on the video" if ui["obj"] == "pick" else ("tracking" if obj_box is not None else "lost")),
