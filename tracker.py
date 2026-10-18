@@ -41,6 +41,7 @@ HELD_ITEMS = ("bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "
               "orange", "hot dog", "donut", "cake", "remote", "cell phone", "book", "scissors", "toothbrush",
               "mouse", "clock", "vase", "teddy bear", "hair drier", "sports ball", "frisbee", "baseball bat",
               "tennis racket", "umbrella", "handbag", "tie")        # things that fit in a hand, no refrigerators
+LABEL_AS = {"remote": "phone", "toothbrush": "pen"}  # what the detector tends to call these in practice
 PINCH_REACH = 0.85                                  # pinch point must be this far from the wrist (hand sizes), a fist is closer
 TRAIL_LEN = 30                                      # fingertip trail length (frames)
 SMOOTH_FRAMES = 7                                   # frames averaged for count and mood
@@ -189,7 +190,7 @@ class ObjectFinder:
                     if hx1 <= cx <= hx2 and hy1 <= cy <= hy2:
                         sc = d.categories[0].score
                         if best is None or sc > best[2]:
-                            best = ((bb.origin_x, bb.origin_y, bb.width, bb.height), d.categories[0].category_name, sc)
+                            best = ((bb.origin_x, bb.origin_y, bb.width, bb.height), LABEL_AS.get(d.categories[0].category_name, d.categories[0].category_name), sc)
             with self.lock:
                 if best:
                     self.result = (best[0], best[1], time.time())
@@ -205,8 +206,11 @@ class ObjectFinder:
 
 
 class ObjectTracker:
-    # follows a picked object as a rotated, scaled box. ORB features matched against the first view give rotation + size,
-    # CSRT keeps it moving when features run out (plain, dark or blurry objects)
+    # follows a picked object as a rotated, scaled box. three ways, best first:
+    #   features: ORB keypoints matched to the first view give exact rotation + size (textured objects)
+    #   shape:    color of the object vs what surrounds it picks out the object's outline, a rotated rectangle is fit to it
+    #             (plain or dark objects like a phone screen)
+    #   box:      CSRT only slides the box along, no rotation (last resort)
     def __init__(self, frame, roi):
         x, y, bw, bh = roi
         self.orb = cv2.ORB_create(nfeatures=900, fastThreshold=10)
@@ -222,13 +226,83 @@ class ObjectTracker:
         self.csrt.init(frame, roi)
         self.cs_center = np.float32([x + bw/2, y + bh/2])
         self.misses = 0
-        self.mode = "features" if len(self.ref_pts) >= 12 else "box"
+        self.mode = "box"
+        self.hist = self._color_model(frame, roi)
+
+    @staticmethod
+    def _bins(img):
+        # one color-bin number per pixel, 12 hue x 8 saturation x 8 brightness
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.int32)
+        return (hsv[..., 0]*12//180)*64 + (hsv[..., 1]*8//256)*8 + (hsv[..., 2]*8//256)
+
+    def _color_model(self, frame, roi):
+        # how much more common each color is inside the box than in the ring around it, 0..255
+        H, W = frame.shape[:2]
+        x, y, bw, bh = roi
+        bins = self._bins(frame)
+        ix, iy = int(bw*0.15), int(bh*0.15)                                 # shrink inward so box edges don't leak background in
+        inner = np.zeros((H, W), np.uint8)
+        inner[y + iy:y + bh - iy, x + ix:x + bw - ix] = 255
+        outer = np.zeros((H, W), np.uint8)
+        ox, oy = int(bw*0.5), int(bh*0.5)
+        outer[max(y - oy, 0):y + bh + oy, max(x - ox, 0):x + bw + ox] = 255
+        box_m = np.zeros((H, W), np.uint8)
+        box_m[y:y + bh, x:x + bw] = 255
+        ring = cv2.subtract(outer, cv2.dilate(box_m, np.ones((9, 9), np.uint8)))
+        ho = np.bincount(bins[inner > 0], minlength=768).astype(np.float32)
+        hb = np.bincount(bins[ring > 0], minlength=768).astype(np.float32)
+        ho /= max(float(ho.sum()), 1.0)
+        hb /= max(float(hb.sum()), 1.0)
+        ratio = np.clip(ho/(hb + 0.002), 0, 1)                              # colors the ring also has score low
+        return (ratio*255).astype(np.float32)
+
+    def _shape(self, frame):
+        # outline of the object near its last position as a rotated rectangle, or None
+        H, W = frame.shape[:2]
+        c = self.quad.mean(axis=0)
+        big = ((self.quad - c)*1.7 + c)
+        x0, y0 = np.maximum(big.min(axis=0), 0).astype(int)
+        x1, y1 = np.minimum(big.max(axis=0), [W, H]).astype(int)
+        if x1 - x0 < 20 or y1 - y0 < 20:
+            return None
+        back = self.hist[self._bins(frame[y0:y1, x0:x1])].astype(np.uint8)
+        _, m = cv2.threshold(back, 60, 255, cv2.THRESH_BINARY)
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        m = cv2.morphologyEx(cv2.morphologyEx(m, cv2.MORPH_OPEN, k), cv2.MORPH_CLOSE, k)
+        cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            return None
+        local = (c - [x0, y0]).astype(np.float32)
+        area_prev = cv2.contourArea(self.quad.astype(np.float32))
+        best = None
+        for cn in cnts:                                                     # biggest blob that sits on the last position
+            a = cv2.contourArea(cn)
+            if a < 0.25*area_prev or a > 3.0*area_prev:
+                continue
+            if cv2.pointPolygonTest(cn, (float(local[0]), float(local[1])), True) < -0.15*np.sqrt(area_prev):
+                continue
+            if best is None or a > best[0]:
+                best = (a, cn)
+        if best is None:
+            return None
+        box = cv2.boxPoints(cv2.minAreaRect(best[1])) + [x0, y0]
+        return self._match_order(box.astype(np.float32))
+
+    def _match_order(self, box):
+        # same corner order as the current quad so smoothing blends matching corners
+        best, best_d = box, 1e18
+        for r in range(4):
+            cand = np.roll(box, r, axis=0)
+            d = float(((cand - self.quad)**2).sum())
+            if d < best_d:
+                best, best_d = cand, d
+        return best
 
     def update(self, frame):
         # returns the 4 corners (float32, 4x2) or None when lost
         found, box = self.csrt.update(frame)
         cs = np.float32([box[0] + box[2]/2, box[1] + box[3]/2]) if found else None
-        new = None
+        new, mode = None, "box"
         if self.des is not None and len(self.ref_pts) >= 12:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             mask = np.zeros_like(gray)                                      # search near where it was, 2x its size
@@ -238,22 +312,25 @@ class ObjectTracker:
             kp, des = self.orb.detectAndCompute(gray, mask)
             if des is not None and len(kp) >= 12:
                 good = [m[0] for m in self.bf.knnMatch(self.des, des, k=2) if len(m) == 2 and m[0].distance < 0.75*m[1].distance]
-                if len(good) >= 10:
+                if len(good) >= 12:
                     src = self.ref_pts[[m.queryIdx for m in good]]
                     dst = np.float32([kp[m.trainIdx].pt for m in good])
                     M, inl = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC, ransacReprojThreshold=4.0)
-                    if M is not None and inl is not None and int(inl.sum()) >= 8:
+                    if M is not None and inl is not None and int(inl.sum()) >= 12:
                         cand = cv2.transform(self.quad0.reshape(-1, 1, 2), M).reshape(4, 2)
-                        area0 = cv2.contourArea(self.quad0)
-                        if 0.1 < cv2.contourArea(cand)/area0 < 10:          # reject wild scale jumps
-                            new = cand.astype(np.float32)
+                        if 0.1 < cv2.contourArea(cand)/cv2.contourArea(self.quad0) < 10:
+                            new, mode = cand.astype(np.float32), "features"
+        if new is None:
+            shp = self._shape(frame)
+            if shp is not None:
+                new, mode = shp, "shape"
         if new is not None:
-            self.quad = 0.65*new + 0.35*self.quad                           # light smoothing
+            self.quad = (0.6*new + 0.4*self.quad).astype(np.float32)        # light smoothing
             self.misses = 0
-            self.mode = "features"
-        elif cs is not None:                                                # no features: slide the box with CSRT's motion
+            self.mode = mode
+        elif cs is not None:                                                # nothing found: slide the box with CSRT's motion
             self.quad = self.quad + (cs - self.cs_center)
-            self.misses = 0 if self.mode == "box" else self.misses + 1
+            self.misses += 1
             self.mode = "box"
             if self.misses > 90:
                 return None
@@ -621,7 +698,7 @@ def main():
                     cv2.line(frame, obj_trail[i - 1], obj_trail[i], (0, int(255*i/len(obj_trail)), 255), 2, cv2.LINE_AA)
                 cv2.polylines(frame, [obj_box.astype(np.int32).reshape(-1, 1, 2)], True, YEL, 2, cv2.LINE_AA)
                 bx, by = obj_box[:, 0].min(), obj_box[:, 1].min()
-                text(frame, "object", (int(bx), max(int(by) - 8, 14)), 0.55, YEL, 1)
+                text(frame, f"object ({obj_tracker.mode})", (int(bx), max(int(by) - 8, 14)), 0.55, YEL, 1)
             elif obj_tracker is not None:
                 text(frame, "object lost, press o and pick again", (12, 28), 0.7, RED, 2)
             if auto_hit:
