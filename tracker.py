@@ -421,8 +421,14 @@ def draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, fstates, calib, tab, 
         # blinks
         header("BLINKS", 332)
         br = info.get("blink_rate")
-        text(p, "--" if br is None else f"{br:.2f} /s", (16, 368), 0.9, WHITE if br is not None else DIM, 2)
-        text(p, "" if br is None else f"{br*60:.0f} /min   total {info.get('blink_total', 0)}", (150, 368), 0.45, (170, 170, 170), 1)
+        if br is None:
+            big = "--"
+        elif br == 0:
+            big = f"> {BLINK_WINDOW:.0f} s"                                 # no blink in the whole window
+        else:
+            big = f"{1/br:.1f} s"                                           # seconds per blink
+        text(p, big, (16, 368), 0.9, WHITE if br is not None else DIM, 2)
+        text(p, "" if br is None else f"per blink   total {info.get('blink_total', 0)}", (150, 368), 0.45, (170, 170, 170), 1)
     else:
         # finger count
         header("FINGERS UP", 108)
