@@ -29,6 +29,8 @@ Options: `--camera 1` (pick another camera), `--selftest` (grab 60 frames headle
 - `Tab`, `1`, `2`, or click a tab - switch between FACE and HANDS
 - `t` - track index fingertip (trail + coordinates), HANDS tab
 - `o` - track an object: drag a box around it on the video, HANDS tab
+- `a` - auto-detect the object in your hand (common items only: cup, phone, bottle, scissors, remote, book...), HANDS tab
+- Pinch thumb and index together - tracks the pinch point with a trail, no checkbox needed
 
 ## Tuning (top of `tracker.py`)
 | Constant | Effect |

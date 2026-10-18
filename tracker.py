@@ -1,9 +1,10 @@
 # live hand + face tracker, webcam in, sidebar out
 # hands: boxes, red skeleton, finger count | face: happy/neutral/sad + head tilt
-# keys: Tab / 1 / 2 or click = switch tab, t = track fingertip, o = track object, c = calibrate, q or Esc = quit | window is resizable | usage: tracker.py [--camera N] [--selftest]
+# keys: Tab / 1 / 2 or click = switch tab, t = track fingertip (or just pinch), o = track object, a = auto-detect held object, c = calibrate, q or Esc = quit | window is resizable | usage: tracker.py [--camera N] [--selftest]
 import argparse
 import os
 import sys
+import threading
 import time
 import urllib.request
 from collections import deque
@@ -18,9 +19,11 @@ from mediapipe.tasks.python import vision
 HERE = os.path.dirname(os.path.abspath(__file__))
 HAND_MODEL = os.path.join(HERE, "models", "hand_landmarker.task")
 FACE_MODEL = os.path.join(HERE, "models", "face_landmarker.task")
+OBJ_MODEL = os.path.join(HERE, "models", "efficientdet_lite0.tflite")
 MODEL_URLS = {
     HAND_MODEL: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task",
     FACE_MODEL: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task",
+    OBJ_MODEL: "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/latest/efficientdet_lite0.tflite",
 }
 
 # tuning
@@ -30,6 +33,10 @@ ANGRY_DELTA = 0.45                                  # anger score above neutral 
 SURPRISE_DELTA = 0.55                               # surprise score above neutral baseline needed for surprised
 BLINK_CLOSE, BLINK_OPEN = 0.55, 0.35                # eyelid closure to count a blink / to re-arm, gap stops double counts
 BLINK_WINDOW = 20.0                                 # seconds the blink rate is averaged over
+PINCH_ON, PINCH_OFF = 0.22, 0.32                     # thumb-index gap over hand size to start / stop a pinch, gap stops flicker
+DETECT_EVERY = 0.25                                 # seconds between auto object detections
+OBJ_SCORE = 0.30                                    # min confidence for an auto-detected object
+OBJ_KEEP = 0.7                                      # seconds an auto-detected box stays up after its last hit
 TRAIL_LEN = 30                                      # fingertip trail length (frames)
 SMOOTH_FRAMES = 7                                   # frames averaged for count and mood
 CALIB_FRAMES = 30                                   # frames averaged for calibration
@@ -43,7 +50,8 @@ TABS = ("FACE", "HANDS")
 TAB_X = ((16, 134), (146, 264))                     # tab x ranges in the sidebar
 TAB_Y0, TAB_Y1 = 48, 82                             # tab bar y range
 CHECK_BOX = (16, 360, 264, 382)                     # "track fingertip" checkbox, hands tab only
-CHECK_OBJ = (16, 386, 264, 408)                     # "track object" checkbox, hands tab only
+CHECK_OBJ = (16, 384, 264, 406)                     # "track object" checkbox, hands tab only
+CHECK_AUTO = (16, 408, 264, 430)                    # "auto-detect object" checkbox, hands tab only
 WIN = "Hand + Face Tracker"
 
 # colors (BGR) and landmark ids
@@ -131,6 +139,61 @@ def head_pose(lms, w, h):
     pitch = np.degrees(np.arctan2(chin[2] - top[2], chin[1] - top[1]))      # chin farther from camera = looking up
     yaw = np.degrees(np.arctan2(rc[2] - lc[2], rc[0] - lc[0]))              # right cheek farther = turned right
     return float(pitch), float(yaw)
+
+
+def pinch_ratio(pts):
+    # thumb tip to index tip gap over hand size (wrist to middle knuckle), small = pinching
+    size = max(np.hypot(pts[9][0] - pts[0][0], pts[9][1] - pts[0][1]), 1e-6)
+    return float(np.hypot(pts[4][0] - pts[8][0], pts[4][1] - pts[8][1])/size)
+
+
+class ObjectFinder:
+    # runs an object detector on a background thread so the video never waits on it
+    def __init__(self):
+        self.det = vision.ObjectDetector.create_from_options(vision.ObjectDetectorOptions(
+            base_options=mp_py.BaseOptions(model_asset_path=OBJ_MODEL),
+            running_mode=vision.RunningMode.IMAGE, max_results=8, score_threshold=OBJ_SCORE,
+            category_denylist=["person"]))
+        self.job = None                                                     # (rgb frame, hand boxes) waiting to run
+        self.result = None                                                  # (box, name, time)
+        self.lock = threading.Lock()
+        self.alive = True
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def submit(self, rgb, hand_boxes):
+        with self.lock:
+            self.job = (rgb, hand_boxes)
+
+    def _run(self):
+        while self.alive:
+            with self.lock:
+                job, self.job = self.job, None
+            if job is None:
+                time.sleep(0.02)
+                continue
+            rgb, boxes = job
+            res = self.det.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
+            best = None
+            for d in res.detections:
+                bb = d.bounding_box
+                cx, cy = bb.origin_x + bb.width/2, bb.origin_y + bb.height/2
+                for hx1, hy1, hx2, hy2 in boxes:                           # object center must sit in the hand area
+                    if hx1 <= cx <= hx2 and hy1 <= cy <= hy2:
+                        sc = d.categories[0].score
+                        if best is None or sc > best[2]:
+                            best = ((bb.origin_x, bb.origin_y, bb.width, bb.height), d.categories[0].category_name, sc)
+            with self.lock:
+                if best:
+                    self.result = (best[0], best[1], time.time())
+            time.sleep(DETECT_EVERY)
+
+    def latest(self):
+        with self.lock:
+            r = self.result
+        return r if r and time.time() - r[2] < OBJ_KEEP else None
+
+    def stop(self):
+        self.alive = False
 
 
 def hand_countable(pts, face_box):
@@ -241,31 +304,31 @@ def draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, fstates, calib, tab, 
                 V.circle(p, (60 + i*42, y - 6), 11, GREEN if up else (60, 60, 60), -1 if up else 2, cv2.LINE_AA)
             y += 32
 
-        # fingertip tracking
-        x0, y0, x1, y1 = CHECK_BOX
-        V.rectangle(p, (x0, y0 + 2), (x0 + 20, y0 + 22), GREY, 2)
-        if info.get("track"):
-            V.line(p, (x0 + 4, y0 + 12), (x0 + 9, y0 + 18), (0, 200, 255), 3)
-            V.line(p, (x0 + 9, y0 + 18), (x0 + 17, y0 + 6), (0, 200, 255), 3)
-        text(p, "Track fingertip  (t)", (x0 + 32, y0 + 17), 0.55, WHITE if info.get("track") else GREY, 1)
-
-        # object tracking
-        x0, y0, x1, y1 = CHECK_OBJ
-        on = info.get("obj") is not None
-        V.rectangle(p, (x0, y0 + 2), (x0 + 20, y0 + 22), GREY, 2)
-        if on:
-            V.line(p, (x0 + 4, y0 + 12), (x0 + 9, y0 + 18), (0, 200, 255), 3)
-            V.line(p, (x0 + 9, y0 + 18), (x0 + 17, y0 + 6), (0, 200, 255), 3)
-        text(p, "Track object  (o)", (x0 + 32, y0 + 17), 0.55, WHITE if on else GREY, 1)
-        status = info.get("obj")
-        if info.get("track") and info.get("tips"):
-            tips = info["tips"]
-            status = "   ".join(f"{sd[0]} ({tips[sd][0]},{tips[sd][1]})" for sd in ("Left", "Right") if sd in tips) + ("   " + status if status else "")
-        if status:
-            text(p, status, (16, 428), 0.42, (170, 170, 170), 1)
+        # fingertip, object and auto-object checkboxes: (box, label, ticked, status word, status color)
+        YEL, CYN, REDC = (0, 220, 255), (255, 220, 0), (60, 60, 255)
+        obj = info.get("obj")
+        auto = info.get("auto")
+        rows = (
+            (CHECK_BOX, "Track fingertip  (t)", bool(info.get("track")), info.get("pinch"), YEL),
+            (CHECK_OBJ, "Track object  (o)", obj is not None, obj, REDC if obj == "lost" else (GREEN if obj == "tracking" else YEL)),
+            (CHECK_AUTO, "Auto-detect  (a)", auto is not None, auto, CYN if auto and auto != "searching" else DIM),
+        )
+        for (x0, y0, x1, y1), label, on, status, scol in rows:
+            V.rectangle(p, (x0, y0 + 2), (x0 + 20, y0 + 22), GREY, 2)
+            if on:
+                V.line(p, (x0 + 4, y0 + 12), (x0 + 9, y0 + 18), (0, 200, 255), 3)
+                V.line(p, (x0 + 9, y0 + 18), (x0 + 17, y0 + 6), (0, 200, 255), 3)
+            text(p, label, (x0 + 30, y0 + 17), 0.5, WHITE if on else GREY, 1)
+            if status:
+                text(p, status, (x0 + 168, y0 + 17), 0.45, scol, 1)
+        tips = info.get("tips")
+        if tips:
+            msg = "   ".join(f"{sd[0]} ({tips[sd][0]},{tips[sd][1]})" for sd in ("Left", "Right") if sd in tips)
+            text(p, msg, (16, 452), 0.42, (170, 170, 170), 1)
 
     # footer
-    text(p, "CALIBRATING - look straight" if calib else "c = calibrate (look straight)", (16, h - 34), 0.45, (0, 200, 255) if calib else (140, 140, 140), 1)
+    if tab == 0 or calib:
+        text(p, "CALIBRATING - look straight" if calib else "c = calibrate (look straight)", (16, h - 34), 0.45, (0, 200, 255) if calib else (140, 140, 140), 1)
     text(p, "Tab / 1 / 2 = switch   q / Esc = quit", (16, h - 12), 0.45, (140, 140, 140), 1)
     return p
 
@@ -309,7 +372,7 @@ def main():
         raise SystemExit(f"Could not open camera {args.camera}. Try --camera 1.")
 
     # window: resizable, tabs switch on click (mouse coords arrive in image pixels)
-    ui = {"tab": 0, "w": 0, "k": 1.0, "track": False,
+    ui = {"tab": 0, "w": 0, "k": 1.0, "track": False, "auto": False,
           "obj": None,                                # None off, "pick" waiting for a drag, "on" tracking
           "drag": None,                               # [x0, y0, x1, y1] while dragging, video pixels
           "roi": None}                                # finished drag, tracker starts on the next frame
@@ -334,7 +397,7 @@ def main():
         if ev != cv2.EVENT_LBUTTONDOWN:
             return
         if ui["tab"] == 1:
-            for box, fn in ((CHECK_BOX, lambda: ui.update(track=not ui["track"])), (CHECK_OBJ, toggle_obj)):
+            for box, fn in ((CHECK_BOX, lambda: ui.update(track=not ui["track"])), (CHECK_OBJ, toggle_obj), (CHECK_AUTO, lambda: ui.update(auto=not ui["auto"]))):
                 bx0, by0, bx1, by1 = box
                 if ui["w"] + bx0*k <= x <= ui["w"] + bx1*k and by0*k <= y <= by1*k:
                     fn()
@@ -363,6 +426,10 @@ def main():
     obj_tracker = None                              # CSRT tracker locked onto a picked object
     obj_box = None                                  # its latest box (x, y, w, h), None when lost
     obj_trail = deque(maxlen=TRAIL_LEN)
+    pinching = {}                                   # hand label -> currently pinching
+    trail_mode = {}                                 # hand label -> "pinch" or "tip", the trail resets when it changes
+    finder = None                                   # auto object detector, made on first use
+    last_detect = 0.0
     pitch0 = yaw0 = 0.0                             # looking straight (deg)
     calib_buf = []                                  # (sad, pitch, yaw) while calibrating, None when done, starts calibrating
     tilt = None                                     # (up/down, left/right), -100 to 100
@@ -405,6 +472,7 @@ def main():
         # hands
         counts = {}
         tips = {}
+        hand_boxes = []
         seen = set()
         for ii, lms in enumerate(hres.hand_landmarks):
             # mediapipe label is swapped on a mirrored feed, flip it back
@@ -430,6 +498,8 @@ def main():
                 if up:
                     shown.update((m, a, b, t))
                     lines += [(m, a), (a, b), (b, t)]
+            hx1, hy1, hx2, hy2 = bbox([pts[j] for j in shown], 20, w, h)
+            hand_boxes.append(bbox(pts, int(0.3*max(hx2 - hx1, hy2 - hy1)), w, h))      # where a held object can sit
             if ui["tab"] == 1:                                              # hand overlay only on the hands tab
                 x1, y1, x2, y2 = bbox([pts[j] for j in shown], 20, w, h)                    # hand box
                 cv2.rectangle(frame, (x1, y1), (x2, y2), WHITE, 2)
@@ -439,17 +509,37 @@ def main():
                     cv2.line(frame, tuple(map(int, pts[a])), tuple(map(int, pts[b])), RED, 2, cv2.LINE_AA)
                 for j in shown:
                     cv2.circle(frame, (int(pts[j][0]), int(pts[j][1])), 4, RED, -1, cv2.LINE_AA)
-            if ui["track"]:
-                tip = (int(pts[8][0]), int(pts[8][1]))                      # index fingertip
+            r = pinch_ratio(pts)                                            # pinch = thumb tip meets index tip
+            pinching[label] = r < (PINCH_OFF if pinching.get(label) else PINCH_ON)
+            if ui["track"] or pinching[label]:
+                if pinching[label]:
+                    tip = (int((pts[4][0] + pts[8][0])/2), int((pts[4][1] + pts[8][1])/2))   # pinch point
+                else:
+                    tip = (int(pts[8][0]), int(pts[8][1]))                  # index fingertip
+                mode = "pinch" if pinching[label] else "tip"
                 tips[label] = tip
                 tr = trails.setdefault(label, deque(maxlen=TRAIL_LEN))
+                if trail_mode.get(label) != mode:
+                    tr.clear()
+                trail_mode[label] = mode
                 tr.append(tip)
                 if ui["tab"] == 1:
+                    col = (255, 0, 200) if mode == "pinch" else (0, 200, 255)
                     for i in range(1, len(tr)):                             # trail fades toward the tail
                         c = int(255*i/len(tr))
-                        cv2.line(frame, tr[i - 1], tr[i], (0, c, 255), 2, cv2.LINE_AA)
-                    cv2.circle(frame, tip, 10, (0, 200, 255), 2, cv2.LINE_AA)
-                    cv2.circle(frame, tip, 3, (0, 200, 255), -1, cv2.LINE_AA)
+                        cv2.line(frame, tr[i - 1], tr[i], (c*col[0]//255, c*col[1]//255, c*col[2]//255), 2, cv2.LINE_AA)
+                    cv2.circle(frame, tip, 10, col, 2, cv2.LINE_AA)
+                    cv2.circle(frame, tip, 3, col, -1, cv2.LINE_AA)
+            else:
+                trails.pop(label, None)
+        auto_hit = None
+        if ui["auto"]:
+            if finder is None:
+                finder = ObjectFinder()
+            if hand_boxes and time.time() - last_detect > DETECT_EVERY:
+                finder.submit(rgb, hand_boxes)
+                last_detect = time.time()
+            auto_hit = finder.latest() if hand_boxes else None
         if ui["tab"] == 1:                                                  # object overlay on the hands tab
             YEL = (0, 220, 255)
             if ui["drag"]:
@@ -465,6 +555,10 @@ def main():
                 text(frame, "object", (bx, max(by - 8, 14)), 0.55, YEL, 1)
             elif obj_tracker is not None:
                 text(frame, "object lost, press o and pick again", (12, 28), 0.7, RED, 2)
+            if auto_hit:
+                (ax, ay, aw, ah), name, _ = auto_hit
+                cv2.rectangle(frame, (ax, ay), (ax + aw, ay + ah), (255, 220, 0), 2)
+                text(frame, name, (ax, max(ay - 8, 14)), 0.55, (255, 220, 0), 1)
         for k in list(count_hist):                                          # drop hands that left the frame
             if k not in seen:
                 del count_hist[k]
@@ -516,6 +610,8 @@ def main():
             blink_times.popleft()
         span = min(BLINK_WINDOW, now - t0)
         info = {"ang": ang_rel, "sur": sur_rel, "track": ui["track"], "tips": tips, "blink_total": blink_total,
+                "pinch": "pinching" if any(pinching.get(sd) for sd in counts) else None,
+                "auto": None if not ui["auto"] else (auto_hit[1] if auto_hit else "searching"),
                 "obj": None if ui["obj"] is None else ("drag a box on the video" if ui["obj"] == "pick" else ("tracking" if obj_box else "lost")),
                 "blink_rate": len(blink_times)/span if mood and span > 3 else None}
         fps = 0.9*fps + 0.1/max(now - last, 1e-6)                           # smoothed fps
@@ -545,6 +641,8 @@ def main():
             ui["track"] = not ui["track"]
         if key == ord("o"):
             toggle_obj()
+        if key == ord("a"):
+            ui["auto"] = not ui["auto"]
         if key == ord("1"):
             ui["tab"] = 0
         if key == ord("2"):
@@ -554,6 +652,8 @@ def main():
         if key in (ord("q"), 27) or cv2.getWindowProperty(WIN, cv2.WND_PROP_VISIBLE) < 1:
             break
 
+    if finder:
+        finder.stop()
     cap.release()
     cv2.destroyAllWindows()
     if args.selftest:
