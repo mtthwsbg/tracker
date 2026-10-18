@@ -1,6 +1,6 @@
 # live hand + face tracker, webcam in, sidebar out
 # hands: boxes, red skeleton, finger count | face: happy/neutral/sad + head tilt
-# keys: c = calibrate, q or Esc = quit | usage: tracker.py [--camera N] [--selftest]
+# keys: Tab / 1 / 2 or click = switch tab, c = calibrate, q or Esc = quit | window is resizable | usage: tracker.py [--camera N] [--selftest]
 import argparse
 import os
 import sys
@@ -34,6 +34,10 @@ TILT_SAD_COMP = 0.35                                # looking up fakes a frown, 
 PALM_MIN = 0.25                                     # how square-on the hand must face the camera, 0 = edge-on
 UP_ON, UP_OFF = 0.80, 0.65                          # finger straightness to switch on / off, gap stops flicker
 SIDEBAR_W = 280                                     # sidebar width (px)
+TABS = ("FACE", "HANDS")
+TAB_X = ((16, 134), (146, 264))                     # tab x ranges in the sidebar
+TAB_Y0, TAB_Y1 = 48, 82                             # tab bar y range
+WIN = "Hand + Face Tracker"
 
 # colors (BGR) and landmark ids
 WHITE = (255, 255, 255)
@@ -123,7 +127,7 @@ def hand_countable(pts, face_box):
     return flat
 
 
-def draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, calib):
+def draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, fstates, calib, tab):
     p = np.full((h, SIDEBAR_W, 3), (30, 30, 30), np.uint8)
     cv2.line(p, (0, 0), (0, h), (90, 90, 90), 2)
     GREY, DIM = (190, 190, 190), (120, 120, 120)
@@ -143,40 +147,63 @@ def draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, calib):
 
     text(p, f"{fps:.0f} FPS", (16, 32), 0.8, WHITE, 2)
 
-    # face
-    header("FACE", 66)
-    colors = {"Happy": (0, 220, 0), "Sad": (255, 140, 40), "Neutral": WHITE}
-    text(p, mood if mood else "No face", (16, 102), 1.1, colors.get(mood, DIM), 2)
-    if mood:
-        text(p, f"smile {smile:.2f}   sad {sad_rel:+.2f} / {SAD_DELTA:.2f}", (16, 124), 0.45, (170, 170, 170), 1)
+    # tabs
+    for i, name in enumerate(TABS):
+        x0, x1 = TAB_X[i]
+        on = i == tab
+        cv2.rectangle(p, (x0, TAB_Y0), (x1, TAB_Y1), (70, 70, 70) if on else (45, 45, 45), -1)
+        text(p, name, (x0 + 14, TAB_Y1 - 10), 0.6, WHITE if on else DIM, 1)
+        if on:
+            cv2.line(p, (x0, TAB_Y1), (x1, TAB_Y1), (0, 200, 255), 2)
 
-    # tilt
-    header("TILT  (-100..100)", 156)
-    ud, lr = tilt if tilt else (None, None)
-    text(p, "Up / Down", (16, 190), 0.6, GREY, 1)
-    text(p, "--" if ud is None else f"{ud:+d}", (170, 190), 0.9, WHITE if tilt else DIM, 2)
-    bar(ud, 200)
-    text(p, "Left / Right", (16, 230), 0.6, GREY, 1)
-    text(p, "--" if lr is None else f"{lr:+d}", (170, 230), 0.9, WHITE if tilt else DIM, 2)
-    bar(lr, 240)
+    if tab == 0:
+        # mood
+        header("MOOD", 108)
+        colors = {"Happy": (0, 220, 0), "Sad": (255, 140, 40), "Neutral": WHITE}
+        text(p, mood if mood else "No face", (16, 148), 1.1, colors.get(mood, DIM), 2)
+        if mood:
+            text(p, f"smile {smile:.2f}   sad {sad_rel:+.2f} / {SAD_DELTA:.2f}", (16, 172), 0.45, (170, 170, 170), 1)
 
-    # hands
-    header("HANDS", 280)
-    y = 318
-    for side in ("Left", "Right"):
-        n = counts.get(side)
-        text(p, f"{side}:", (16, y), 0.8, GREY, 1)
-        text(p, "--" if n is None else str(n), (150, y), 1.2, WHITE if n is not None else DIM, 2)
-        if side in counts and n is None:
-            text(p, "paused", (190, y), 0.45, DIM, 1)
-        y += 42
-    shown = [v for v in counts.values() if v is not None]
-    text(p, "Total:", (16, y + 4), 0.8, GREY, 1)
-    text(p, str(sum(shown)) if shown else "--", (150, y + 4), 1.2, WHITE if shown else DIM, 2)
+        # tilt
+        header("TILT  (-100..100)", 208)
+        ud, lr = tilt if tilt else (None, None)
+        text(p, "Up / Down", (16, 242), 0.6, GREY, 1)
+        text(p, "--" if ud is None else f"{ud:+d}", (170, 242), 0.9, WHITE if tilt else DIM, 2)
+        bar(ud, 252)
+        text(p, "Left / Right", (16, 282), 0.6, GREY, 1)
+        text(p, "--" if lr is None else f"{lr:+d}", (170, 282), 0.9, WHITE if tilt else DIM, 2)
+        bar(lr, 292)
+    else:
+        # finger count
+        header("FINGERS UP", 108)
+        y = 146
+        for side in ("Left", "Right"):
+            n = counts.get(side)
+            text(p, f"{side}:", (16, y), 0.8, GREY, 1)
+            text(p, "--" if n is None else str(n), (150, y), 1.2, WHITE if n is not None else DIM, 2)
+            if side in counts and n is None:
+                text(p, "paused", (190, y), 0.45, DIM, 1)
+            y += 42
+        shown = [v for v in counts.values() if v is not None]
+        text(p, "Total:", (16, y + 4), 0.8, GREY, 1)
+        text(p, str(sum(shown)) if shown else "--", (150, y + 4), 1.2, WHITE if shown else DIM, 2)
+
+        # per finger
+        header("EACH FINGER", 268)
+        y = 306
+        for side in ("Left", "Right"):
+            text(p, side[0], (16, y), 0.6, GREY, 1)
+            sts = fstates.get(side) if side in counts else None
+            for i, nm in enumerate(("T", "I", "M", "R", "P")):
+                cx = 60 + i*42
+                up = bool(sts[i]) if sts else False
+                cv2.circle(p, (cx, y - 6), 11, GREEN if up else (60, 60, 60), -1 if up else 2, cv2.LINE_AA)
+                text(p, nm, (cx - 5, y + 28), 0.4, DIM, 1)
+            y += 58
 
     # footer
     text(p, "CALIBRATING - look straight" if calib else "c = calibrate (look straight)", (16, h - 34), 0.45, (0, 200, 255) if calib else (140, 140, 140), 1)
-    text(p, "q / Esc = quit", (16, h - 12), 0.45, (140, 140, 140), 1)
+    text(p, "Tab / 1 / 2 = switch   q / Esc = quit", (16, h - 12), 0.45, (140, 140, 140), 1)
     return p
 
 
@@ -217,6 +244,18 @@ def main():
     cap = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY)
     if not cap.isOpened():
         raise SystemExit(f"Could not open camera {args.camera}. Try --camera 1.")
+
+    # window: resizable, tabs switch on click (mouse coords arrive in image pixels)
+    ui = {"tab": 0, "w": 0}
+    def on_mouse(ev, x, y, flags, _):
+        if ev != cv2.EVENT_LBUTTONDOWN or not TAB_Y0 <= y <= TAB_Y1:
+            return
+        for i, (x0, x1) in enumerate(TAB_X):
+            if ui["w"] + x0 <= x <= ui["w"] + x1:
+                ui["tab"] = i
+    if not args.selftest:
+        cv2.namedWindow(WIN, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+        cv2.setMouseCallback(WIN, on_mouse)
 
     # initial conditions
     count_hist = {}                                 # hand label -> recent counts
@@ -323,18 +362,25 @@ def main():
         now = time.time()
         fps = 0.9*fps + 0.1/max(now - last, 1e-6)                           # smoothed fps
         last = now
-        panel = draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, calib_buf is not None)
+        panel = draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, finger_state, calib_buf is not None, ui["tab"])
+        ui["w"] = w
         frame = np.hstack([frame, panel])
 
         if args.selftest:
             if frames >= 60:
                 break
             continue
-        cv2.imshow("Hand + Face Tracker (q to quit)", frame)
+        cv2.imshow(WIN, frame)
         key = cv2.waitKey(1) & 0xFF
         if key == ord("c"):
             calib_buf = []
-        if key in (ord("q"), 27) or cv2.getWindowProperty("Hand + Face Tracker (q to quit)", cv2.WND_PROP_VISIBLE) < 1:
+        if key == ord("1"):
+            ui["tab"] = 0
+        if key == ord("2"):
+            ui["tab"] = 1
+        if key == 9:                                                        # Tab
+            ui["tab"] = 1 - ui["tab"]
+        if key in (ord("q"), 27) or cv2.getWindowProperty(WIN, cv2.WND_PROP_VISIBLE) < 1:
             break
 
     cap.release()
