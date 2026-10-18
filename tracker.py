@@ -456,7 +456,7 @@ def draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, fstates, calib, tab, 
         obj = info.get("obj")
         auto = info.get("auto")
         rows = (
-            (CHECK_BOX, "Track fingertip  (t)", bool(info.get("track")), info.get("pinch"), YEL),
+            (CHECK_BOX, "Trace on pinch  (t)", bool(info.get("track")), info.get("pinch"), YEL),
             (CHECK_OBJ, "Track object  (o)", obj is not None, obj, REDC if obj == "lost" else (GREEN if obj == "tracking" else YEL)),
             (CHECK_AUTO, "Auto-detect  (a)", auto is not None, auto, CYN if auto and auto != "searching" else DIM),
         )
@@ -519,7 +519,7 @@ def main():
         raise SystemExit(f"Could not open camera {args.camera}. Try --camera 1.")
 
     # window: resizable, tabs switch on click (mouse coords arrive in image pixels)
-    ui = {"tab": 0, "w": 0, "k": 1.0, "track": False, "auto": False,
+    ui = {"tab": 0, "w": 0, "k": 1.0, "track": True, "auto": False,
           "obj": None,                                # None off, "pick" waiting for a drag, "on" tracking
           "drag": None,                               # [x0, y0, x1, y1] while dragging, video pixels
           "roi": None}                                # finished drag, tracker starts on the next frame
@@ -657,7 +657,7 @@ def main():
                     cv2.circle(frame, (int(pts[j][0]), int(pts[j][1])), 4, RED, -1, cv2.LINE_AA)
             r = pinch_ratio(pts)                                            # pinch = thumb tip meets index tip
             pinching[label] = r < (PINCH_OFF if pinching.get(label) else PINCH_ON)
-            if ui["track"] or pinching[label]:
+            if ui["track"] and pinching[label]:                             # trace only while pinching
                 if pinching[label]:
                     tip = (int((pts[4][0] + pts[8][0])/2), int((pts[4][1] + pts[8][1])/2))   # pinch point
                 else:
