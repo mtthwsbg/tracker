@@ -569,7 +569,7 @@ def main():
                     lines += [(m, a), (a, b), (b, t)]
             hx1, hy1, hx2, hy2 = bbox([pts[j] for j in shown], 20, w, h)
             hand_boxes.append(bbox(pts, int(0.3*max(hx2 - hx1, hy2 - hy1)), w, h))      # where a held object can sit
-            if ui["tab"] == 1:                                              # hand overlay only on the hands tab
+            if ui["tab"] == 1 and ui["obj"] is None and not ui["auto"]:     # hand overlay only on the hands tab, and not while tracking objects
                 x1, y1, x2, y2 = bbox([pts[j] for j in shown], 20, w, h)                    # hand box
                 cv2.rectangle(frame, (x1, y1), (x2, y2), WHITE, 2)
                 px1, py1, px2, py2 = bbox([pts[j] for j in PALM_POINTS], 6, w, h)           # palm box
