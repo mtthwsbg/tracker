@@ -1,6 +1,6 @@
 # live hand + face tracker, webcam in, sidebar out
 # hands: boxes, red skeleton, finger count | face: happy/neutral/sad + head tilt
-# keys: Tab / 1 / 2 or click = switch tab, t = track fingertip, c = calibrate, q or Esc = quit | window is resizable | usage: tracker.py [--camera N] [--selftest]
+# keys: Tab / 1 / 2 or click = switch tab, t = track fingertip, o = track object, c = calibrate, q or Esc = quit | window is resizable | usage: tracker.py [--camera N] [--selftest]
 import argparse
 import os
 import sys
@@ -42,7 +42,8 @@ SIDEBAR_W = 280                                     # sidebar width (px)
 TABS = ("FACE", "HANDS")
 TAB_X = ((16, 134), (146, 264))                     # tab x ranges in the sidebar
 TAB_Y0, TAB_Y1 = 48, 82                             # tab bar y range
-CHECK_BOX = (16, 384, 264, 408)                     # "track fingertip" checkbox, hands tab only
+CHECK_BOX = (16, 360, 264, 382)                     # "track fingertip" checkbox, hands tab only
+CHECK_OBJ = (16, 386, 264, 408)                     # "track object" checkbox, hands tab only
 WIN = "Hand + Face Tracker"
 
 # colors (BGR) and landmark ids
@@ -229,16 +230,16 @@ def draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, fstates, calib, tab, 
 
         # per finger
         header("EACH FINGER", 268)
-        y = 300
+        for i, nm in enumerate(("T", "I", "M", "R", "P")):                   # finger names once, above the first row
+            text(p, nm, (60 + i*42 - 5, 292), 0.4, DIM, 1)
+        y = 316
         for side in ("Left", "Right"):
             text(p, side[0], (16, y), 0.6, GREY, 1)
             sts = fstates.get(side) if side in counts else None
-            for i, nm in enumerate(("T", "I", "M", "R", "P")):
-                cx = 60 + i*42
+            for i in range(5):
                 up = bool(sts[i]) if sts else False
-                V.circle(p, (cx, y - 6), 11, GREEN if up else (60, 60, 60), -1 if up else 2, cv2.LINE_AA)
-                text(p, nm, (cx - 5, y + 28), 0.4, DIM, 1)
-            y += 52
+                V.circle(p, (60 + i*42, y - 6), 11, GREEN if up else (60, 60, 60), -1 if up else 2, cv2.LINE_AA)
+            y += 32
 
         # fingertip tracking
         x0, y0, x1, y1 = CHECK_BOX
@@ -246,11 +247,22 @@ def draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, fstates, calib, tab, 
         if info.get("track"):
             V.line(p, (x0 + 4, y0 + 12), (x0 + 9, y0 + 18), (0, 200, 255), 3)
             V.line(p, (x0 + 9, y0 + 18), (x0 + 17, y0 + 6), (0, 200, 255), 3)
-        text(p, "Track fingertip  (t)", (x0 + 32, y0 + 19), 0.55, WHITE if info.get("track") else GREY, 1)
-        if info.get("track"):
-            tips = info.get("tips", {})
-            msg = "   ".join(f"{sd[0]} " + (f"({tips[sd][0]},{tips[sd][1]})" if sd in tips else "--") for sd in ("Left", "Right"))
-            text(p, msg, (16, 426), 0.45, (170, 170, 170), 1)
+        text(p, "Track fingertip  (t)", (x0 + 32, y0 + 17), 0.55, WHITE if info.get("track") else GREY, 1)
+
+        # object tracking
+        x0, y0, x1, y1 = CHECK_OBJ
+        on = info.get("obj") is not None
+        V.rectangle(p, (x0, y0 + 2), (x0 + 20, y0 + 22), GREY, 2)
+        if on:
+            V.line(p, (x0 + 4, y0 + 12), (x0 + 9, y0 + 18), (0, 200, 255), 3)
+            V.line(p, (x0 + 9, y0 + 18), (x0 + 17, y0 + 6), (0, 200, 255), 3)
+        text(p, "Track object  (o)", (x0 + 32, y0 + 17), 0.55, WHITE if on else GREY, 1)
+        status = info.get("obj")
+        if info.get("track") and info.get("tips"):
+            tips = info["tips"]
+            status = "   ".join(f"{sd[0]} ({tips[sd][0]},{tips[sd][1]})" for sd in ("Left", "Right") if sd in tips) + ("   " + status if status else "")
+        if status:
+            text(p, status, (16, 428), 0.42, (170, 170, 170), 1)
 
     # footer
     text(p, "CALIBRATING - look straight" if calib else "c = calibrate (look straight)", (16, h - 34), 0.45, (0, 200, 255) if calib else (140, 140, 140), 1)
@@ -297,20 +309,42 @@ def main():
         raise SystemExit(f"Could not open camera {args.camera}. Try --camera 1.")
 
     # window: resizable, tabs switch on click (mouse coords arrive in image pixels)
-    ui = {"tab": 0, "w": 0, "k": 1.0, "track": False}
+    ui = {"tab": 0, "w": 0, "k": 1.0, "track": False,
+          "obj": None,                                # None off, "pick" waiting for a drag, "on" tracking
+          "drag": None,                               # [x0, y0, x1, y1] while dragging, video pixels
+          "roi": None}                                # finished drag, tracker starts on the next frame
+    def toggle_obj():
+        ui["obj"] = None if ui["obj"] else "pick"
+        ui["drag"] = ui["roi"] = None
+
     def on_mouse(ev, x, y, flags, _):
         k = ui["k"]
+        vx, vy = int(x/k), int(y/k)                                         # video pixels
+        if ui["obj"] == "pick" and ui["tab"] == 1 and x < ui["w"]:          # drag a box around the object
+            if ev == cv2.EVENT_LBUTTONDOWN:
+                ui["drag"] = [vx, vy, vx, vy]
+            elif ev == cv2.EVENT_MOUSEMOVE and ui["drag"]:
+                ui["drag"][2:] = [vx, vy]
+            elif ev == cv2.EVENT_LBUTTONUP and ui["drag"]:
+                x0, y0, x1, y1 = ui["drag"][0], ui["drag"][1], vx, vy
+                ui["drag"] = None
+                if abs(x1 - x0) > 12 and abs(y1 - y0) > 12:
+                    ui["roi"] = (min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0))
+                return
         if ev != cv2.EVENT_LBUTTONDOWN:
             return
-        bx0, by0, bx1, by1 = CHECK_BOX
-        if ui["tab"] == 1 and ui["w"] + bx0*k <= x <= ui["w"] + bx1*k and by0*k <= y <= by1*k:
-            ui["track"] = not ui["track"]
-            return
+        if ui["tab"] == 1:
+            for box, fn in ((CHECK_BOX, lambda: ui.update(track=not ui["track"])), (CHECK_OBJ, toggle_obj)):
+                bx0, by0, bx1, by1 = box
+                if ui["w"] + bx0*k <= x <= ui["w"] + bx1*k and by0*k <= y <= by1*k:
+                    fn()
+                    return
         if not TAB_Y0*k <= y <= TAB_Y1*k:
             return
         for i, (x0, x1) in enumerate(TAB_X):
             if ui["w"] + x0*k <= x <= ui["w"] + x1*k:
                 ui["tab"] = i
+
     if not args.selftest:
         cv2.namedWindow(WIN, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
         cv2.setMouseCallback(WIN, on_mouse)
@@ -326,6 +360,9 @@ def main():
     blink_times = deque()                           # timestamps of recent blinks
     blink_total = 0
     trails = {}                                     # hand label -> fingertip trail
+    obj_tracker = None                              # CSRT tracker locked onto a picked object
+    obj_box = None                                  # its latest box (x, y, w, h), None when lost
+    obj_trail = deque(maxlen=TRAIL_LEN)
     pitch0 = yaw0 = 0.0                             # looking straight (deg)
     calib_buf = []                                  # (sad, pitch, yaw) while calibrating, None when done, starts calibrating
     tilt = None                                     # (up/down, left/right), -100 to 100
@@ -344,6 +381,19 @@ def main():
             break
         frame = cv2.flip(frame, 1)                                          # mirror
         h, w = frame.shape[:2]
+        if ui["obj"] is None:
+            obj_tracker = obj_box = None
+            obj_trail.clear()
+        if ui["roi"]:                                                       # start tracking the picked box
+            obj_tracker = cv2.TrackerCSRT_create()
+            obj_tracker.init(frame, ui["roi"])
+            obj_trail.clear()
+            ui["obj"], ui["roi"] = "on", None
+        if obj_tracker is not None:
+            found, box = obj_tracker.update(frame)
+            obj_box = tuple(int(v) for v in box) if found else None
+            if obj_box:
+                obj_trail.append((obj_box[0] + obj_box[2]//2, obj_box[1] + obj_box[3]//2))
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         ts = int((time.time() - t0)*1000)                                   # timestamp (ms)
@@ -400,6 +450,21 @@ def main():
                         cv2.line(frame, tr[i - 1], tr[i], (0, c, 255), 2, cv2.LINE_AA)
                     cv2.circle(frame, tip, 10, (0, 200, 255), 2, cv2.LINE_AA)
                     cv2.circle(frame, tip, 3, (0, 200, 255), -1, cv2.LINE_AA)
+        if ui["tab"] == 1:                                                  # object overlay on the hands tab
+            YEL = (0, 220, 255)
+            if ui["drag"]:
+                d = ui["drag"]
+                cv2.rectangle(frame, (d[0], d[1]), (d[2], d[3]), YEL, 2)
+            elif ui["obj"] == "pick":
+                text(frame, "drag a box around the object", (12, 28), 0.7, YEL, 2)
+            elif obj_box:
+                for i in range(1, len(obj_trail)):
+                    cv2.line(frame, obj_trail[i - 1], obj_trail[i], (0, int(255*i/len(obj_trail)), 255), 2, cv2.LINE_AA)
+                bx, by, bw, bh = obj_box
+                cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), YEL, 2)
+                text(frame, "object", (bx, max(by - 8, 14)), 0.55, YEL, 1)
+            elif obj_tracker is not None:
+                text(frame, "object lost, press o and pick again", (12, 28), 0.7, RED, 2)
         for k in list(count_hist):                                          # drop hands that left the frame
             if k not in seen:
                 del count_hist[k]
@@ -451,6 +516,7 @@ def main():
             blink_times.popleft()
         span = min(BLINK_WINDOW, now - t0)
         info = {"ang": ang_rel, "sur": sur_rel, "track": ui["track"], "tips": tips, "blink_total": blink_total,
+                "obj": None if ui["obj"] is None else ("drag a box on the video" if ui["obj"] == "pick" else ("tracking" if obj_box else "lost")),
                 "blink_rate": len(blink_times)/span if mood and span > 3 else None}
         fps = 0.9*fps + 0.1/max(now - last, 1e-6)                           # smoothed fps
         last = now
@@ -477,6 +543,8 @@ def main():
             calib_buf = []
         if key == ord("t"):
             ui["track"] = not ui["track"]
+        if key == ord("o"):
+            toggle_obj()
         if key == ord("1"):
             ui["tab"] = 0
         if key == ord("2"):
