@@ -27,7 +27,7 @@ Options: `--camera 1` (pick another camera), `--selftest` (grab 60 frames headle
 - `c` - calibrate: look straight with a relaxed face (also happens automatically at start)
 - `q` or `Esc` - quit
 - `Tab`, `1`, `2`, or click a tab - switch between FACE and HANDS
-- `t` - turn the pinch trace on or off (default on). The trace only draws while you pinch thumb and index together
+- `t` - turn the pinch trace on or off (default off). The trace only draws while you pinch thumb and index together
 - `o` - track an object: drag a box around it on the video. The box rotates and resizes with it (feature matching), HANDS tab
 - `a` - auto-detect the object in your hand (common items only: cup, phone, bottle, scissors, remote, book...), HANDS tab
 

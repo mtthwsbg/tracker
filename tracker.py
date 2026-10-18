@@ -534,7 +534,7 @@ def main():
         raise SystemExit(f"Could not open camera {args.camera}. Try --camera 1.")
 
     # window: resizable, tabs switch on click (mouse coords arrive in image pixels)
-    ui = {"tab": 0, "w": 0, "k": 1.0, "track": True, "auto": False,
+    ui = {"tab": 0, "w": 0, "k": 1.0, "track": False, "auto": False,
           "obj": None,                                # None off, "pick" waiting for a drag, "on" tracking
           "drag": None,                               # [x0, y0, x1, y1] while dragging, video pixels
           "roi": None}                                # finished drag, tracker starts on the next frame
