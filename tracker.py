@@ -1,6 +1,6 @@
 # live hand + face tracker, webcam in, sidebar out
 # hands: boxes, red skeleton, finger count | face: happy/neutral/sad + head tilt
-# keys: Tab / 1 / 2 or click = switch tab, c = calibrate, q or Esc = quit | window is resizable | usage: tracker.py [--camera N] [--selftest]
+# keys: Tab / 1 / 2 or click = switch tab, t = track fingertip, c = calibrate, q or Esc = quit | window is resizable | usage: tracker.py [--camera N] [--selftest]
 import argparse
 import os
 import sys
@@ -26,6 +26,11 @@ MODEL_URLS = {
 # tuning
 HAPPY_SMILE = 0.40                                  # smile score needed for happy
 SAD_DELTA = 0.15                                    # sad score above neutral baseline needed for sad, lower = more sensitive
+ANGRY_DELTA = 0.45                                  # anger score above neutral baseline needed for angry
+SURPRISE_DELTA = 0.55                               # surprise score above neutral baseline needed for surprised
+BLINK_CLOSE, BLINK_OPEN = 0.55, 0.35                # eyelid closure to count a blink / to re-arm, gap stops double counts
+BLINK_WINDOW = 20.0                                 # seconds the blink rate is averaged over
+TRAIL_LEN = 30                                      # fingertip trail length (frames)
 SMOOTH_FRAMES = 7                                   # frames averaged for count and mood
 CALIB_FRAMES = 30                                   # frames averaged for calibration
 PITCH_RANGE = 30.0                                  # up/down tilt that reads as +/-100 (deg)
@@ -37,6 +42,7 @@ SIDEBAR_W = 280                                     # sidebar width (px)
 TABS = ("FACE", "HANDS")
 TAB_X = ((16, 134), (146, 264))                     # tab x ranges in the sidebar
 TAB_Y0, TAB_Y1 = 48, 82                             # tab bar y range
+CHECK_BOX = (16, 384, 264, 408)                     # "track fingertip" checkbox, hands tab only
 WIN = "Hand + Face Tracker"
 
 # colors (BGR) and landmark ids
@@ -91,12 +97,25 @@ def face_scores(bs, fpts):
            + 0.5*bs.get("mouthShrugLower", 0)
            + 0.3*avg("mouthPressLeft", "mouthPressRight")
            + 8.0*max(droop, 0))
-    return smile, sad
+    anger = (1.2*avg("browDownLeft", "browDownRight")
+             + 0.6*avg("noseSneerLeft", "noseSneerRight")
+             + 0.5*avg("eyeSquintLeft", "eyeSquintRight")
+             + 0.4*avg("mouthPressLeft", "mouthPressRight")
+             - 0.5*bs.get("browInnerUp", 0))
+    surprise = (0.5*avg("browOuterUpLeft", "browOuterUpRight")
+                + 0.5*bs.get("browInnerUp", 0)
+                + 0.6*avg("eyeWideLeft", "eyeWideRight")
+                + 0.5*bs.get("jawOpen", 0))
+    return smile, sad, anger, surprise
 
 
-def classify_face(smile, sad, sad_base):
+def classify_face(smile, sad, sad_base, ang_rel, sur_rel):
+    if sur_rel > SURPRISE_DELTA:
+        return "Surprised"
     if smile > HAPPY_SMILE:
         return "Happy"
+    if ang_rel > ANGRY_DELTA:
+        return "Angry"
     if sad - sad_base > SAD_DELTA:
         return "Sad"
     return "Neutral"
@@ -127,7 +146,8 @@ def hand_countable(pts, face_box):
     return flat
 
 
-def draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, fstates, calib, tab, k=1.0):
+def draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, fstates, calib, tab, k=1.0, info=None):
+    info = info or {}
     # everything is drawn at the final pixel size (k = display scale), so text stays sharp when the window is resized
     p = np.full((int(h*k), int(SIDEBAR_W*k), 3), (30, 30, 30), np.uint8)
     P = lambda pt: (int(round(pt[0]*k)), int(round(pt[1]*k)))
@@ -171,20 +191,27 @@ def draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, fstates, calib, tab, 
     if tab == 0:
         # mood
         header("MOOD", 108)
-        colors = {"Happy": (0, 220, 0), "Sad": (255, 140, 40), "Neutral": WHITE}
+        colors = {"Happy": (0, 220, 0), "Sad": (255, 140, 40), "Angry": (60, 60, 255), "Surprised": (0, 220, 255), "Neutral": WHITE}
         text(p, mood if mood else "No face", (16, 148), 1.1, colors.get(mood, DIM), 2)
         if mood:
-            text(p, f"smile {smile:.2f}   sad {sad_rel:+.2f} / {SAD_DELTA:.2f}", (16, 172), 0.45, (170, 170, 170), 1)
+            text(p, f"smile {smile:.2f}   sad {sad_rel:+.2f} / {SAD_DELTA:.2f}", (16, 168), 0.45, (170, 170, 170), 1)
+            text(p, f"angry {info.get('ang', 0):+.2f} / {ANGRY_DELTA:.2f}   surprise {info.get('sur', 0):+.2f} / {SURPRISE_DELTA:.2f}", (16, 186), 0.45, (170, 170, 170), 1)
 
         # tilt
-        header("TILT  (-100..100)", 208)
+        header("TILT  (-100..100)", 214)
         ud, lr = tilt if tilt else (None, None)
-        text(p, "Up / Down", (16, 242), 0.6, GREY, 1)
-        text(p, "--" if ud is None else f"{ud:+d}", (170, 242), 0.9, WHITE if tilt else DIM, 2)
-        bar(ud, 252)
-        text(p, "Left / Right", (16, 282), 0.6, GREY, 1)
-        text(p, "--" if lr is None else f"{lr:+d}", (170, 282), 0.9, WHITE if tilt else DIM, 2)
-        bar(lr, 292)
+        text(p, "Up / Down", (16, 248), 0.6, GREY, 1)
+        text(p, "--" if ud is None else f"{ud:+d}", (170, 248), 0.9, WHITE if tilt else DIM, 2)
+        bar(ud, 258)
+        text(p, "Left / Right", (16, 288), 0.6, GREY, 1)
+        text(p, "--" if lr is None else f"{lr:+d}", (170, 288), 0.9, WHITE if tilt else DIM, 2)
+        bar(lr, 298)
+
+        # blinks
+        header("BLINKS", 332)
+        br = info.get("blink_rate")
+        text(p, "--" if br is None else f"{br:.2f} /s", (16, 368), 0.9, WHITE if br is not None else DIM, 2)
+        text(p, "" if br is None else f"{br*60:.0f} /min   total {info.get('blink_total', 0)}", (150, 368), 0.45, (170, 170, 170), 1)
     else:
         # finger count
         header("FINGERS UP", 108)
@@ -202,7 +229,7 @@ def draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, fstates, calib, tab, 
 
         # per finger
         header("EACH FINGER", 268)
-        y = 306
+        y = 300
         for side in ("Left", "Right"):
             text(p, side[0], (16, y), 0.6, GREY, 1)
             sts = fstates.get(side) if side in counts else None
@@ -211,7 +238,19 @@ def draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, fstates, calib, tab, 
                 up = bool(sts[i]) if sts else False
                 V.circle(p, (cx, y - 6), 11, GREEN if up else (60, 60, 60), -1 if up else 2, cv2.LINE_AA)
                 text(p, nm, (cx - 5, y + 28), 0.4, DIM, 1)
-            y += 58
+            y += 52
+
+        # fingertip tracking
+        x0, y0, x1, y1 = CHECK_BOX
+        V.rectangle(p, (x0, y0 + 2), (x0 + 20, y0 + 22), GREY, 2)
+        if info.get("track"):
+            V.line(p, (x0 + 4, y0 + 12), (x0 + 9, y0 + 18), (0, 200, 255), 3)
+            V.line(p, (x0 + 9, y0 + 18), (x0 + 17, y0 + 6), (0, 200, 255), 3)
+        text(p, "Track fingertip  (t)", (x0 + 32, y0 + 19), 0.55, WHITE if info.get("track") else GREY, 1)
+        if info.get("track"):
+            tips = info.get("tips", {})
+            msg = "   ".join(f"{sd[0]} " + (f"({tips[sd][0]},{tips[sd][1]})" if sd in tips else "--") for sd in ("Left", "Right"))
+            text(p, msg, (16, 426), 0.45, (170, 170, 170), 1)
 
     # footer
     text(p, "CALIBRATING - look straight" if calib else "c = calibrate (look straight)", (16, h - 34), 0.45, (0, 200, 255) if calib else (140, 140, 140), 1)
@@ -258,10 +297,16 @@ def main():
         raise SystemExit(f"Could not open camera {args.camera}. Try --camera 1.")
 
     # window: resizable, tabs switch on click (mouse coords arrive in image pixels)
-    ui = {"tab": 0, "w": 0, "k": 1.0}
+    ui = {"tab": 0, "w": 0, "k": 1.0, "track": False}
     def on_mouse(ev, x, y, flags, _):
         k = ui["k"]
-        if ev != cv2.EVENT_LBUTTONDOWN or not TAB_Y0*k <= y <= TAB_Y1*k:
+        if ev != cv2.EVENT_LBUTTONDOWN:
+            return
+        bx0, by0, bx1, by1 = CHECK_BOX
+        if ui["tab"] == 1 and ui["w"] + bx0*k <= x <= ui["w"] + bx1*k and by0*k <= y <= by1*k:
+            ui["track"] = not ui["track"]
+            return
+        if not TAB_Y0*k <= y <= TAB_Y1*k:
             return
         for i, (x0, x1) in enumerate(TAB_X):
             if ui["w"] + x0*k <= x <= ui["w"] + x1*k:
@@ -275,6 +320,12 @@ def main():
     finger_state = {}                               # hand label -> thumb..pinky up/down, for hysteresis
     face_hist = deque(maxlen=SMOOTH_FRAMES)         # recent moods
     sad_base = 0.0                                  # neutral sad score
+    ang_base = sur_base = 0.0                       # neutral anger / surprise scores
+    ang_rel = sur_rel = 0.0
+    eyes_closed = False                             # blink state
+    blink_times = deque()                           # timestamps of recent blinks
+    blink_total = 0
+    trails = {}                                     # hand label -> fingertip trail
     pitch0 = yaw0 = 0.0                             # looking straight (deg)
     calib_buf = []                                  # (sad, pitch, yaw) while calibrating, None when done, starts calibrating
     tilt = None                                     # (up/down, left/right), -100 to 100
@@ -303,6 +354,7 @@ def main():
 
         # hands
         counts = {}
+        tips = {}
         seen = set()
         for ii, lms in enumerate(hres.hand_landmarks):
             # mediapipe label is swapped on a mirrored feed, flip it back
@@ -337,10 +389,22 @@ def main():
                     cv2.line(frame, tuple(map(int, pts[a])), tuple(map(int, pts[b])), RED, 2, cv2.LINE_AA)
                 for j in shown:
                     cv2.circle(frame, (int(pts[j][0]), int(pts[j][1])), 4, RED, -1, cv2.LINE_AA)
+            if ui["track"]:
+                tip = (int(pts[8][0]), int(pts[8][1]))                      # index fingertip
+                tips[label] = tip
+                tr = trails.setdefault(label, deque(maxlen=TRAIL_LEN))
+                tr.append(tip)
+                if ui["tab"] == 1:
+                    for i in range(1, len(tr)):                             # trail fades toward the tail
+                        c = int(255*i/len(tr))
+                        cv2.line(frame, tr[i - 1], tr[i], (0, c, 255), 2, cv2.LINE_AA)
+                    cv2.circle(frame, tip, 10, (0, 200, 255), 2, cv2.LINE_AA)
+                    cv2.circle(frame, tip, 3, (0, 200, 255), -1, cv2.LINE_AA)
         for k in list(count_hist):                                          # drop hands that left the frame
             if k not in seen:
                 del count_hist[k]
                 finger_state.pop(k, None)
+                trails.pop(k, None)
         if hres.hand_landmarks:
             hand_frames += 1
 
@@ -349,23 +413,31 @@ def main():
             face_frames += 1
             bs = {c.category_name: c.score for c in fres.face_blendshapes[0]}   # blendshape scores
             fpts = [(l.x*w, l.y*h) for l in fres.face_landmarks[0]]             # px
-            smile, sad = face_scores(bs, fpts)
+            smile, sad, ang, sur = face_scores(bs, fpts)
             pitch, yaw = head_pose(fres.face_landmarks[0], w, h)
             if calib_buf is not None:
-                calib_buf.append((sad, pitch, yaw))
+                calib_buf.append((sad, pitch, yaw, ang, sur))
                 if len(calib_buf) >= CALIB_FRAMES:
-                    sad_base, pitch0, yaw0 = (float(v) for v in np.mean(calib_buf, axis=0))
+                    sad_base, pitch0, yaw0, ang_base, sur_base = (float(v) for v in np.mean(calib_buf, axis=0))
                     calib_buf = None
             pn = float(np.clip((pitch - pitch0)/PITCH_RANGE, -1, 1))            # up/down, -1 to 1
             yn = float(np.clip((yaw - yaw0)/YAW_RANGE, -1, 1))                  # left/right, -1 to 1
             tilt = (int(round(pn*100)), int(round(yn*100)))
             sad_eff = sad - TILT_SAD_COMP*max(pn, 0)                            # looking up bends the lips into a fake frown
             sad_rel = sad_eff - sad_base
-            face_hist.append(classify_face(smile, sad_eff, sad_base))
+            ang_rel, sur_rel = ang - ang_base, sur - sur_base
+            face_hist.append(classify_face(smile, sad_eff, sad_base, ang_rel, sur_rel))
+            blink = (bs.get("eyeBlinkLeft", 0) + bs.get("eyeBlinkRight", 0))/2
+            if not eyes_closed and blink > BLINK_CLOSE:
+                eyes_closed = True
+                blink_times.append(time.time())
+                blink_total += 1
+            elif eyes_closed and blink < BLINK_OPEN:
+                eyes_closed = False
             mood = majority(face_hist, "Neutral")
             fx1, fy1, fx2, fy2 = bbox(fpts, 10, w, h)
             if ui["tab"] == 0:                                              # face box only on the face tab
-                cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), GREEN, 1)
+                cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), GREEN, 2)
             face_box = (fx1, fy1, fx2, fy2)
         else:
             face_hist.clear()
@@ -375,6 +447,11 @@ def main():
 
         # sidebar
         now = time.time()
+        while blink_times and now - blink_times[0] > BLINK_WINDOW:
+            blink_times.popleft()
+        span = min(BLINK_WINDOW, now - t0)
+        info = {"ang": ang_rel, "sur": sur_rel, "track": ui["track"], "tips": tips, "blink_total": blink_total,
+                "blink_rate": len(blink_times)/span if mood and span > 3 else None}
         fps = 0.9*fps + 0.1/max(now - last, 1e-6)                           # smoothed fps
         last = now
         # fit to the window: scale the video, then draw the sidebar at that size
@@ -386,7 +463,7 @@ def main():
         k = max(k, 0.5)
         if abs(k - 1) > 0.01:
             frame = cv2.resize(frame, (int(w*k), int(h*k)), interpolation=cv2.INTER_AREA if k < 1 else cv2.INTER_CUBIC)
-        panel = draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, finger_state, calib_buf is not None, ui["tab"], k)
+        panel = draw_panel(h, fps, mood, smile, sad_rel, tilt, counts, finger_state, calib_buf is not None, ui["tab"], k, info)
         ui["w"], ui["k"] = frame.shape[1], k
         frame = np.hstack([frame, panel])
 
@@ -398,6 +475,8 @@ def main():
         key = cv2.waitKey(1) & 0xFF
         if key == ord("c"):
             calib_buf = []
+        if key == ord("t"):
+            ui["track"] = not ui["track"]
         if key == ord("1"):
             ui["tab"] = 0
         if key == ord("2"):
