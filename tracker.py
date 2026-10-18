@@ -37,6 +37,11 @@ PINCH_ON, PINCH_OFF = 0.22, 0.32                     # thumb-index gap over hand
 DETECT_EVERY = 0.25                                 # seconds between auto object detections
 OBJ_SCORE = 0.30                                    # min confidence for an auto-detected object
 OBJ_KEEP = 0.7                                      # seconds an auto-detected box stays up after its last hit
+HELD_ITEMS = ("bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich",
+              "orange", "hot dog", "donut", "cake", "remote", "cell phone", "book", "scissors", "toothbrush",
+              "mouse", "clock", "vase", "teddy bear", "hair drier", "sports ball", "frisbee", "baseball bat",
+              "tennis racket", "umbrella", "handbag", "tie")        # things that fit in a hand, no refrigerators
+PINCH_REACH = 0.85                                  # pinch point must be this far from the wrist (hand sizes), a fist is closer
 TRAIL_LEN = 30                                      # fingertip trail length (frames)
 SMOOTH_FRAMES = 7                                   # frames averaged for count and mood
 CALIB_FRAMES = 30                                   # frames averaged for calibration
@@ -144,7 +149,10 @@ def head_pose(lms, w, h):
 def pinch_ratio(pts):
     # thumb tip to index tip gap over hand size (wrist to middle knuckle), small = pinching
     size = max(np.hypot(pts[9][0] - pts[0][0], pts[9][1] - pts[0][1]), 1e-6)
-    return float(np.hypot(pts[4][0] - pts[8][0], pts[4][1] - pts[8][1])/size)
+    gap = float(np.hypot(pts[4][0] - pts[8][0], pts[4][1] - pts[8][1]))/size
+    mx, my = (pts[4][0] + pts[8][0])/2, (pts[4][1] + pts[8][1])/2
+    reach = float(np.hypot(mx - pts[0][0], my - pts[0][1]))/size            # a fist keeps the thumb and index near the wrist
+    return gap if reach > PINCH_REACH else 9.0
 
 
 class ObjectFinder:
@@ -153,7 +161,7 @@ class ObjectFinder:
         self.det = vision.ObjectDetector.create_from_options(vision.ObjectDetectorOptions(
             base_options=mp_py.BaseOptions(model_asset_path=OBJ_MODEL),
             running_mode=vision.RunningMode.IMAGE, max_results=8, score_threshold=OBJ_SCORE,
-            category_denylist=["person"]))
+            category_allowlist=list(HELD_ITEMS)))
         self.job = None                                                     # (rgb frame, hand boxes) waiting to run
         self.result = None                                                  # (box, name, time)
         self.lock = threading.Lock()
@@ -194,6 +202,68 @@ class ObjectFinder:
 
     def stop(self):
         self.alive = False
+
+
+class ObjectTracker:
+    # follows a picked object as a rotated, scaled box. ORB features matched against the first view give rotation + size,
+    # CSRT keeps it moving when features run out (plain, dark or blurry objects)
+    def __init__(self, frame, roi):
+        x, y, bw, bh = roi
+        self.orb = cv2.ORB_create(nfeatures=900, fastThreshold=10)
+        self.bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        mask = np.zeros_like(gray)
+        mask[y:y + bh, x:x + bw] = 255
+        kp, self.des = self.orb.detectAndCompute(gray, mask)
+        self.ref_pts = np.float32([k.pt for k in kp]) if kp else np.zeros((0, 2), np.float32)
+        self.quad0 = np.float32([[x, y], [x + bw, y], [x + bw, y + bh], [x, y + bh]])
+        self.quad = self.quad0.copy()
+        self.csrt = cv2.TrackerCSRT_create()
+        self.csrt.init(frame, roi)
+        self.cs_center = np.float32([x + bw/2, y + bh/2])
+        self.misses = 0
+        self.mode = "features" if len(self.ref_pts) >= 12 else "box"
+
+    def update(self, frame):
+        # returns the 4 corners (float32, 4x2) or None when lost
+        found, box = self.csrt.update(frame)
+        cs = np.float32([box[0] + box[2]/2, box[1] + box[3]/2]) if found else None
+        new = None
+        if self.des is not None and len(self.ref_pts) >= 12:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            mask = np.zeros_like(gray)                                      # search near where it was, 2x its size
+            c = self.quad.mean(axis=0)
+            hull = ((self.quad - c)*2.0 + c).astype(np.int32)
+            cv2.fillConvexPoly(mask, hull, 255)
+            kp, des = self.orb.detectAndCompute(gray, mask)
+            if des is not None and len(kp) >= 12:
+                good = [m[0] for m in self.bf.knnMatch(self.des, des, k=2) if len(m) == 2 and m[0].distance < 0.75*m[1].distance]
+                if len(good) >= 10:
+                    src = self.ref_pts[[m.queryIdx for m in good]]
+                    dst = np.float32([kp[m.trainIdx].pt for m in good])
+                    M, inl = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC, ransacReprojThreshold=4.0)
+                    if M is not None and inl is not None and int(inl.sum()) >= 8:
+                        cand = cv2.transform(self.quad0.reshape(-1, 1, 2), M).reshape(4, 2)
+                        area0 = cv2.contourArea(self.quad0)
+                        if 0.1 < cv2.contourArea(cand)/area0 < 10:          # reject wild scale jumps
+                            new = cand.astype(np.float32)
+        if new is not None:
+            self.quad = 0.65*new + 0.35*self.quad                           # light smoothing
+            self.misses = 0
+            self.mode = "features"
+        elif cs is not None:                                                # no features: slide the box with CSRT's motion
+            self.quad = self.quad + (cs - self.cs_center)
+            self.misses = 0 if self.mode == "box" else self.misses + 1
+            self.mode = "box"
+            if self.misses > 90:
+                return None
+        else:
+            self.misses += 1
+            if self.misses > 15:
+                return None
+        if cs is not None:
+            self.cs_center = cs
+        return self.quad
 
 
 def hand_countable(pts, face_box):
@@ -423,8 +493,8 @@ def main():
     blink_times = deque()                           # timestamps of recent blinks
     blink_total = 0
     trails = {}                                     # hand label -> fingertip trail
-    obj_tracker = None                              # CSRT tracker locked onto a picked object
-    obj_box = None                                  # its latest box (x, y, w, h), None when lost
+    obj_tracker = None                              # ObjectTracker locked onto a picked object
+    obj_box = None                                  # its latest rotated box (4 corners), None when lost
     obj_trail = deque(maxlen=TRAIL_LEN)
     pinching = {}                                   # hand label -> currently pinching
     trail_mode = {}                                 # hand label -> "pinch" or "tip", the trail resets when it changes
@@ -452,15 +522,14 @@ def main():
             obj_tracker = obj_box = None
             obj_trail.clear()
         if ui["roi"]:                                                       # start tracking the picked box
-            obj_tracker = cv2.TrackerCSRT_create()
-            obj_tracker.init(frame, ui["roi"])
+            obj_tracker = ObjectTracker(frame, ui["roi"])
             obj_trail.clear()
             ui["obj"], ui["roi"] = "on", None
         if obj_tracker is not None:
-            found, box = obj_tracker.update(frame)
-            obj_box = tuple(int(v) for v in box) if found else None
-            if obj_box:
-                obj_trail.append((obj_box[0] + obj_box[2]//2, obj_box[1] + obj_box[3]//2))
+            obj_box = obj_tracker.update(frame)
+            if obj_box is not None:
+                cx, cy = obj_box.mean(axis=0)
+                obj_trail.append((int(cx), int(cy)))
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         ts = int((time.time() - t0)*1000)                                   # timestamp (ms)
@@ -547,12 +616,12 @@ def main():
                 cv2.rectangle(frame, (d[0], d[1]), (d[2], d[3]), YEL, 2)
             elif ui["obj"] == "pick":
                 text(frame, "drag a box around the object", (12, 28), 0.7, YEL, 2)
-            elif obj_box:
+            elif obj_box is not None:
                 for i in range(1, len(obj_trail)):
                     cv2.line(frame, obj_trail[i - 1], obj_trail[i], (0, int(255*i/len(obj_trail)), 255), 2, cv2.LINE_AA)
-                bx, by, bw, bh = obj_box
-                cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), YEL, 2)
-                text(frame, "object", (bx, max(by - 8, 14)), 0.55, YEL, 1)
+                cv2.polylines(frame, [obj_box.astype(np.int32).reshape(-1, 1, 2)], True, YEL, 2, cv2.LINE_AA)
+                bx, by = obj_box[:, 0].min(), obj_box[:, 1].min()
+                text(frame, "object", (int(bx), max(int(by) - 8, 14)), 0.55, YEL, 1)
             elif obj_tracker is not None:
                 text(frame, "object lost, press o and pick again", (12, 28), 0.7, RED, 2)
             if auto_hit:
@@ -612,7 +681,7 @@ def main():
         info = {"ang": ang_rel, "sur": sur_rel, "track": ui["track"], "tips": tips, "blink_total": blink_total,
                 "pinch": "pinching" if any(pinching.get(sd) for sd in counts) else None,
                 "auto": None if not ui["auto"] else (auto_hit[1] if auto_hit else "searching"),
-                "obj": None if ui["obj"] is None else ("drag a box on the video" if ui["obj"] == "pick" else ("tracking" if obj_box else "lost")),
+                "obj": None if ui["obj"] is None else ("drag a box on the video" if ui["obj"] == "pick" else ("tracking" if obj_box is not None else "lost")),
                 "blink_rate": len(blink_times)/span if mood and span > 3 else None}
         fps = 0.9*fps + 0.1/max(now - last, 1e-6)                           # smoothed fps
         last = now
